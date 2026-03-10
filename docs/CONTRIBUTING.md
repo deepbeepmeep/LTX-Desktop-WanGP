@@ -21,6 +21,8 @@ pnpm setup:dev:mac
 pnpm setup:dev:win
 ```
 
+On Windows, `pnpm setup:dev:win` also clones Wan2GP into the repo subfolder `Wan2GP/` and installs its Python dependencies into the backend venv so the desktop app can use the WanGP engine directly.
+
 Run:
 
 ```bash

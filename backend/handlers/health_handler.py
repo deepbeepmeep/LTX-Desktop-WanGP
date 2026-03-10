@@ -11,6 +11,7 @@ from handlers.models_handler import ModelsHandler
 from handlers.pipelines_handler import PipelinesHandler
 from logging_policy import log_background_exception
 from services.interfaces import GpuInfo
+from services.wangp_bridge import WanGPBridge
 from state.app_state_types import AppState, GpuSlot, StartupError, StartupLoading, StartupPending, StartupReady, VideoPipelineState, VideoPipelineWarmth
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ class HealthHandler(StateHandlerBase):
         gpu_info: GpuInfo,
         config: RuntimeConfig,
         use_sage_attention: bool,
+        wangp_bridge: WanGPBridge,
     ) -> None:
         super().__init__(state, lock)
         self._models = models_handler
@@ -34,8 +36,27 @@ class HealthHandler(StateHandlerBase):
         self._gpu_info = gpu_info
         self._config = config
         self._use_sage_attention = use_sage_attention
+        self._wangp_bridge = wangp_bridge
 
     def get_health(self) -> HealthResponse:
+        if self._config.wangp_enabled:
+            bridge = self._wangp_bridge.get_status()
+            return HealthResponse(
+                status="ok",
+                models_loaded=bridge.available,
+                active_model="wangp" if bridge.available else None,
+                gpu_info=GpuTelemetry(**self._gpu_info.get_gpu_info()),
+                sage_attention=self._use_sage_attention,
+                models_status=[
+                    ModelStatusItem(
+                        id="fast",
+                        name="WanGP LTX-2.3 Distilled",
+                        loaded=bridge.available,
+                        downloaded=bridge.available,
+                    ),
+                ],
+            )
+
         active_model: str | None = None
         models_loaded = False
 
@@ -93,6 +114,14 @@ class HealthHandler(StateHandlerBase):
 
     def default_warmup(self) -> None:
         try:
+            if self._config.wangp_enabled:
+                status = self._wangp_bridge.get_status()
+                if status.available:
+                    self.set_startup_ready()
+                else:
+                    self.set_startup_error(status.reason or "WanGP bridge is unavailable")
+                return
+
             self.set_startup_loading("Checking models", 5)
             status = self._models.get_models_status()
             if not status.all_downloaded:

@@ -16,6 +16,7 @@ from handlers.base import StateHandlerBase
 from handlers.generation_handler import GenerationHandler
 from handlers.pipelines_handler import PipelinesHandler
 from services.interfaces import ZitAPIClient
+from services.wangp_bridge import WanGPBridge
 from state.app_state_types import AppState
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ class ImageGenerationHandler(StateHandlerBase):
         outputs_dir: Path,
         config: RuntimeConfig,
         zit_api_client: ZitAPIClient,
+        wangp_bridge: WanGPBridge,
     ) -> None:
         super().__init__(state, lock)
         self._generation = generation_handler
@@ -41,8 +43,12 @@ class ImageGenerationHandler(StateHandlerBase):
         self._outputs_dir = outputs_dir
         self._config = config
         self._zit_api_client = zit_api_client
+        self._wangp_bridge = wangp_bridge
 
     def generate(self, req: GenerateImageRequest) -> GenerateImageResponse:
+        if self._config.wangp_enabled:
+            return self._generate_via_wangp(req)
+
         if self._generation.is_generation_running():
             raise HTTPError(409, "Generation already in progress")
 
@@ -85,6 +91,39 @@ class ImageGenerationHandler(StateHandlerBase):
             self._generation.fail_generation(str(e))
             if "cancelled" in str(e).lower():
                 logger.info("Image generation cancelled by user")
+                return GenerateImageResponse(status="cancelled")
+            raise HTTPError(500, str(e)) from e
+
+    def _generate_via_wangp(self, req: GenerateImageRequest) -> GenerateImageResponse:
+        if self._generation.is_generation_running():
+            raise HTTPError(409, "Generation already in progress")
+
+        width = (req.width // 16) * 16
+        height = (req.height // 16) * 16
+        num_images = max(1, min(12, req.numImages))
+
+        generation_id = uuid.uuid4().hex[:8]
+        settings = self.state.app_settings.model_copy(deep=True)
+        seed = settings.locked_seed if settings.seed_locked else int(time.time()) % 2147483647
+
+        try:
+            self._generation.start_api_generation(generation_id)
+            output_paths = self._wangp_bridge.generate_images(
+                prompt=req.prompt,
+                width=width,
+                height=height,
+                num_steps=req.numSteps,
+                num_images=num_images,
+                seed=seed,
+                on_progress=self._generation.update_progress,
+                is_cancelled=self._generation.is_generation_cancelled,
+            )
+            self._generation.complete_generation(output_paths)
+            return GenerateImageResponse(status="complete", image_paths=output_paths)
+        except Exception as e:
+            self._generation.fail_generation(str(e))
+            if "cancelled" in str(e).lower():
+                logger.info("WanGP image generation cancelled by user")
                 return GenerateImageResponse(status="cancelled")
             raise HTTPError(500, str(e)) from e
 

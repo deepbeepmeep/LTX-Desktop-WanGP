@@ -31,7 +31,7 @@ const DEFAULT_SETTINGS: GenerationSettings = {
   // Image settings
   imageResolution: '1080p',
   imageAspectRatio: '16:9',
-  imageSteps: 4,
+  imageSteps: 8,
 }
 
 export function Playground() {

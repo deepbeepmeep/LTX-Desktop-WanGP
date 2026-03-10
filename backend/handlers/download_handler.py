@@ -232,6 +232,11 @@ class DownloadHandler(StateHandlerBase):
         self._models_handler.refresh_available_files()
 
     def start_model_download(self, skip_text_encoder: bool = False) -> bool:
+        if self._config.wangp_enabled:
+            with self._lock:
+                self.state.downloading_session = {}
+            return True
+
         with self._lock:
             if self.state.is_downloading:
                 return False
@@ -245,6 +250,11 @@ class DownloadHandler(StateHandlerBase):
         return True
 
     def start_text_encoder_download(self) -> bool:
+        if self._config.wangp_enabled:
+            with self._lock:
+                self.state.downloading_session = {}
+            return True
+
         with self._lock:
             if self.state.is_downloading:
                 return False

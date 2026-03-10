@@ -91,7 +91,7 @@ export function SettingsPanel({
 
           <Select
             label="Quality"
-            value={settings.imageSteps || 4}
+            value={settings.imageSteps || 8}
             onChange={(e) => handleChange('imageSteps', parseInt(e.target.value))}
             disabled={disabled}
           >

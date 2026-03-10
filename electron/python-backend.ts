@@ -140,6 +140,15 @@ function startOwnershipTakeover(): void {
 }
 
 export function getPythonPath(): string {
+  const overridePython = process.env.LTX_BACKEND_PYTHON?.trim()
+  if (overridePython) {
+    if (fs.existsSync(overridePython)) {
+      logger.info(`Using override Python from LTX_BACKEND_PYTHON: ${overridePython}`)
+      return overridePython
+    }
+    logger.warning(`LTX_BACKEND_PYTHON does not exist: ${overridePython}`)
+  }
+
   // In production, use bundled/downloaded Python first
   if (!isDev) {
     const pythonDir = getPythonDir()
@@ -308,7 +317,7 @@ export async function startPythonBackend(): Promise<void> {
 
     pythonProcess.stderr?.on('data', (data: Buffer) => {
       const output = data.toString()
-      console.error(`[Python Error] ${output}`)
+      console.log(`[Python STDERR] ${output}`)
       for (const line of output.split('\n')) {
         const trimmed = line.trimEnd()
         if (trimmed) writeLog('ERROR', 'Backend', trimmed)

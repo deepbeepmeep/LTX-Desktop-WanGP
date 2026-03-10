@@ -1,6 +1,7 @@
 """FastAPI composition root for the LTX backend server."""
 import os
 import sys
+import shlex
 from typing import Any, cast
 
 if os.environ.get("BACKEND_DEBUG") == "1":
@@ -138,6 +139,60 @@ logger.info(f"Models directory: {MODELS_DIR}")
 
 IC_LORA_DIR = MODELS_DIR / "ic-loras"
 
+
+def _resolve_wangp_root() -> Path | None:
+    candidates: list[Path] = []
+    for env_key in ("WANGP_ROOT", "WANGP_WGP_PATH"):
+        raw_value = os.environ.get(env_key, "").strip()
+        if not raw_value:
+            continue
+        candidate = Path(raw_value)
+        if candidate.is_file():
+            candidate = candidate.parent
+        candidates.append(candidate)
+
+    search_roots = [PROJECT_ROOT, *PROJECT_ROOT.parents]
+    for base in search_roots:
+        candidates.append(base)
+        for sibling_name in ("WanGP", "Wan2GP", "wangp", "wan2gp", "w20"):
+            candidates.append(base / sibling_name)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (resolved / "wgp.py").exists():
+            return resolved
+    return None
+
+
+def _resolve_wangp_python(wangp_root: Path | None) -> str | None:
+    env_python = os.environ.get("WANGP_PYTHON", "").strip()
+    if env_python:
+        return env_python
+
+    if wangp_root is not None:
+        if os.name == "nt":
+            venv_candidate = wangp_root / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_candidate = wangp_root / ".venv" / "bin" / "python"
+        if venv_candidate.exists():
+            return str(venv_candidate)
+
+    return sys.executable
+
+
+def _resolve_wangp_extra_args() -> tuple[str, ...]:
+    raw_args = os.environ.get("WANGP_EXTRA_ARGS", "").strip()
+    if not raw_args:
+        return ()
+    return tuple(shlex.split(raw_args))
+
 # ============================================================
 # Settings
 # ============================================================
@@ -160,9 +215,20 @@ migrate_legacy_models_layout(APP_DATA_DIR)
 IC_LORA_DIR.mkdir(parents=True, exist_ok=True)
 
 LTX_API_BASE_URL = "https://api.ltx.video"
+WANGP_ROOT = _resolve_wangp_root()
+WANGP_ENABLED = platform.system() == "Windows" and WANGP_ROOT is not None
+WANGP_PYTHON = _resolve_wangp_python(WANGP_ROOT) if WANGP_ENABLED else None
+WANGP_CONFIG_DIR = APP_DATA_DIR / "wangp_bridge"
+WANGP_VIDEO_MODEL_TYPE = os.environ.get("WANGP_VIDEO_MODEL_TYPE", "ltx2_22B_distilled")
+WANGP_IMAGE_MODEL_TYPE = os.environ.get("WANGP_IMAGE_MODEL_TYPE", "z_image")
+WANGP_EXTRA_ARGS = _resolve_wangp_extra_args()
 
 
 def _resolve_force_api_generations() -> bool:
+    if WANGP_ENABLED:
+        logger.info("WanGP bridge detected at %s; disabling API-only runtime policy", WANGP_ROOT)
+        return False
+
     gpu_info = GpuInfoImpl()
     system = platform.system()
     cuda_available = gpu_info.get_cuda_available()
@@ -186,7 +252,7 @@ def _resolve_force_api_generations() -> bool:
 
 FORCE_API_GENERATIONS = _resolve_force_api_generations()
 REQUIRED_MODEL_TYPES: frozenset[ModelFileType] = (
-    frozenset() if FORCE_API_GENERATIONS else DEFAULT_REQUIRED_MODEL_TYPES
+    frozenset() if (FORCE_API_GENERATIONS or WANGP_ENABLED) else DEFAULT_REQUIRED_MODEL_TYPES
 )
 
 CAMERA_MOTION_PROMPTS = {
@@ -216,6 +282,13 @@ runtime_config = RuntimeConfig(
     use_sage_attention=use_sage_attention,
     camera_motion_prompts=CAMERA_MOTION_PROMPTS,
     default_negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+    wangp_enabled=WANGP_ENABLED,
+    wangp_root=WANGP_ROOT,
+    wangp_python=WANGP_PYTHON,
+    wangp_config_dir=WANGP_CONFIG_DIR,
+    wangp_video_model_type=WANGP_VIDEO_MODEL_TYPE,
+    wangp_image_model_type=WANGP_IMAGE_MODEL_TYPE,
+    wangp_extra_args=WANGP_EXTRA_ARGS,
 )
 
 handler = build_initial_state(runtime_config, DEFAULT_APP_SETTINGS)
@@ -256,6 +329,10 @@ def log_hardware_info() -> None:
     logger.info(f"Device: {DEVICE}  |  Dtype: {DTYPE}")
     logger.info(f"GPU: {gpu_info['name']}  |  VRAM: {vram_gb} GB")
     logger.info(f"SageAttention: {'enabled' if use_sage_attention else 'disabled'}")
+    if WANGP_ENABLED:
+        logger.info("WanGP bridge: enabled  |  Root: %s  |  Python: %s", WANGP_ROOT, WANGP_PYTHON)
+    else:
+        logger.info("WanGP bridge: disabled")
     logger.info(f"Python: {sys.version.split()[0]}  |  Torch: {torch.__version__}")
 
 

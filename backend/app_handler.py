@@ -22,6 +22,7 @@ from handlers import (
     VideoGenerationHandler,
 )
 from runtime_config.runtime_config import RuntimeConfig
+from services.wangp_bridge import WanGPBridge
 from services.interfaces import (
     A2VPipeline,
     FastVideoPipeline,
@@ -82,6 +83,17 @@ class AppHandler:
         self.a2v_pipeline_class = a2v_pipeline_class
         self.retake_pipeline_class = retake_pipeline_class
         self.ic_lora_model_downloader = ic_lora_model_downloader
+        self.wangp_bridge = WanGPBridge(
+            enabled=config.wangp_enabled,
+            root=config.wangp_root,
+            python_executable=config.wangp_python,
+            config_dir=config.wangp_config_dir,
+            output_dir=config.outputs_dir,
+            video_model_type=config.wangp_video_model_type,
+            image_model_type=config.wangp_image_model_type,
+            camera_motion_prompts=config.camera_motion_prompts,
+            extra_args=config.wangp_extra_args,
+        )
 
         self._lock = threading.RLock()
 
@@ -116,6 +128,7 @@ class AppHandler:
             state=self.state,
             lock=self._lock,
             config=config,
+            wangp_bridge=self.wangp_bridge,
         )
 
         self.downloads = DownloadHandler(
@@ -161,6 +174,7 @@ class AppHandler:
             config=config,
             camera_motion_prompts=config.camera_motion_prompts,
             default_negative_prompt=config.default_negative_prompt,
+            wangp_bridge=self.wangp_bridge,
         )
 
         self.image_generation = ImageGenerationHandler(
@@ -171,6 +185,7 @@ class AppHandler:
             outputs_dir=config.outputs_dir,
             config=config,
             zit_api_client=zit_api_client,
+            wangp_bridge=self.wangp_bridge,
         )
 
         self.health = HealthHandler(
@@ -181,6 +196,7 @@ class AppHandler:
             gpu_info=gpu_info,
             config=config,
             use_sage_attention=config.use_sage_attention,
+            wangp_bridge=self.wangp_bridge,
         )
 
         self.runtime_policy = RuntimePolicyHandler(config=config)

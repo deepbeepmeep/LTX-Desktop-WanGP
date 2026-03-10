@@ -72,12 +72,22 @@ function getPhaseMessage(phase: string): string {
       return 'Uploading image...'
     case 'uploading_audio':
       return 'Uploading audio...'
+    case 'preparing_model':
+      return 'Preparing model...'
+    case 'downloading_model':
+      return 'Downloading model files...'
     case 'loading_model':
       return 'Loading model...'
     case 'encoding_text':
       return 'Encoding prompt...'
     case 'inference':
       return 'Generating...'
+    case 'inference_stage_1':
+      return 'Generating video (stage 1/2)...'
+    case 'inference_stage_2':
+      return 'Refining video (stage 2/2)...'
+    case 'inference_stage_3':
+      return 'Refining video (stage 3)...'
     case 'downloading_output':
       return 'Downloading output...'
     case 'decoding':
@@ -168,9 +178,13 @@ export function useGeneration(): UseGenerationReturn {
 
             let displayProgress = data.progress
             let statusMessage = getPhaseMessage(data.phase)
+            const hasStructuredStepProgress =
+              data.currentStep !== null &&
+              data.totalSteps !== null &&
+              data.totalSteps > 0
             
             // Time-based interpolation during inference phase
-            if (data.phase === 'inference') {
+            if (data.phase === 'inference' && !hasStructuredStepProgress) {
               if (lastPhase !== 'inference') {
                 inferenceStartTime = Date.now()
               }
@@ -338,13 +352,14 @@ export function useGeneration(): UseGenerationReturn {
     })
 
     abortControllerRef.current = new AbortController()
+    let progressInterval: ReturnType<typeof setInterval> | null = null
 
     try {
       // Skip prompt enhancement for T2I - use original prompt directly
       const finalPrompt = prompt
 
       const dims = getImageDimensions(settings)
-      const numSteps = settings.imageSteps || 4
+      const numSteps = settings.imageSteps || 8
 
       // Poll for progress
       const pollProgress = async () => {
@@ -354,18 +369,15 @@ export function useGeneration(): UseGenerationReturn {
             const data = await res.json()
             const currentImage = data.currentStep || 0
             const totalImages = data.totalSteps || numImages
+            const phaseMessage = getPhaseMessage(data.phase)
             setState(prev => ({
               ...prev,
               progress: data.progress,
-              statusMessage: data.phase === 'loading_model' 
-                ? 'Loading Z-Image Turbo model...' 
-                : data.phase === 'inference'
-                  ? numImages > 1 
-                    ? `Generating image ${currentImage + 1}/${totalImages}...`
-                    : 'Generating image...'
-                  : data.phase === 'complete'
-                    ? 'Complete!'
-                    : 'Generating...',
+              statusMessage: data.phase === 'inference'
+                ? numImages > 1
+                  ? `Generating image ${currentImage + 1}/${totalImages}...`
+                  : 'Generating image...'
+                : phaseMessage,
             }))
           }
         } catch {
@@ -373,7 +385,7 @@ export function useGeneration(): UseGenerationReturn {
         }
       }
       
-      const progressInterval = setInterval(pollProgress, 500)
+      progressInterval = setInterval(pollProgress, 500)
 
       const response = await backendFetch('/api/generate-image', {
         method: 'POST',
@@ -388,7 +400,10 @@ export function useGeneration(): UseGenerationReturn {
         signal: abortControllerRef.current.signal,
       })
 
-      clearInterval(progressInterval)
+      if (progressInterval) {
+        clearInterval(progressInterval)
+        progressInterval = null
+      }
 
       if (!response.ok) {
         const errorText = await response.text()
@@ -449,6 +464,10 @@ export function useGeneration(): UseGenerationReturn {
           isGenerating: false,
           error: error instanceof Error ? error.message : 'Unknown error',
         }))
+      }
+    } finally {
+      if (progressInterval) {
+        clearInterval(progressInterval)
       }
     }
   }, [appSettings.hasFalApiKey, forceApiGenerations, refreshSettings])

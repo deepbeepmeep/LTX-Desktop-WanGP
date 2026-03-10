@@ -68,6 +68,10 @@ if ! command -v git &>/dev/null; then
 fi
 echo "  git: $(command -v git)"
 
+echo ""
+echo "Ensuring Wan2GP checkout..."
+bash "$SCRIPT_DIR/ensure-wan2gp.sh"
+
 # ============================================================
 # Step 2: Generate requirements.txt from uv.lock
 # ============================================================
@@ -155,6 +159,7 @@ echo "  (This may take a while — PyTorch + ML libraries are large)"
     --no-warn-script-location --quiet
 
 echo "  All dependencies installed"
+echo "  Wan2GP checkout present for packaging"
 
 # ============================================================
 # Step 7: Clean up

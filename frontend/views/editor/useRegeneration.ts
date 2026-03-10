@@ -278,7 +278,7 @@ export function useRegeneration(params: UseRegenerationParams) {
         cameraMotion: params.cameraMotion,
         imageResolution: params.resolution,
         imageAspectRatio: params.imageAspectRatio || '16:9',
-        imageSteps: params.imageSteps || 4,
+        imageSteps: params.imageSteps || 8,
         variations: 1,
       })
     } else {
@@ -297,7 +297,7 @@ export function useRegeneration(params: UseRegenerationParams) {
         cameraMotion: params.cameraMotion,
         imageResolution: '1080p',
         imageAspectRatio: params.imageAspectRatio || '16:9',
-        imageSteps: params.imageSteps || 4,
+        imageSteps: params.imageSteps || 8,
       }
       const videoSettings = shouldVideoGenerateWithLtxApi
         ? sanitizeForcedApiVideoSettings(rawVideoSettings)

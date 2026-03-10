@@ -144,6 +144,8 @@ pnpm setup:dev:mac
 pnpm setup:dev:win
 ```
 
+On Windows, `pnpm setup:dev:win` also clones `https://github.com/deepbeepmeep/Wan2GP` into the repo subfolder `Wan2GP/` and installs its Python dependencies into the backend venv so the desktop app can use the WanGP engine directly. That checkout remains usable on its own if you want to run Wan2GP from the subfolder.
+
 Run:
 
 ```bash
@@ -182,6 +184,7 @@ LTX Desktop collects minimal, anonymous usage analytics (app version, platform, 
 - [`INSTALLER.md`](docs/INSTALLER.md) — building installers
 - [`TELEMETRY.md`](docs/TELEMETRY.md) — telemetry and privacy
 - [`backend/architecture.md`](backend/architecture.md) — backend architecture
+- [`backend/WANGP_BACKEND.md`](backend/WANGP_BACKEND.md) — WanGP bridge configuration
 
 ## Contributing
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from api_types import ModelFileStatus, ModelInfo, ModelsStatusResponse, TextEncoderStatus
 from handlers.base import StateHandlerBase, with_state_lock
 from runtime_config.model_download_specs import MODEL_FILE_ORDER, resolve_required_model_types
+from services.wangp_bridge import WanGPBridge
 from state.app_state_types import AppState, AvailableFiles
 
 if TYPE_CHECKING:
@@ -21,9 +22,11 @@ class ModelsHandler(StateHandlerBase):
         state: AppState,
         lock: RLock,
         config: RuntimeConfig,
+        wangp_bridge: WanGPBridge,
     ) -> None:
         super().__init__(state, lock)
         self._config = config
+        self._wangp_bridge = wangp_bridge
 
     @staticmethod
     def _path_size(path: Path, is_folder: bool) -> int:
@@ -49,6 +52,15 @@ class ModelsHandler(StateHandlerBase):
         return self.state.available_files.copy()
 
     def get_text_encoder_status(self) -> TextEncoderStatus:
+        if self._config.wangp_enabled:
+            status = self._wangp_bridge.get_status()
+            return TextEncoderStatus(
+                downloaded=status.available,
+                size_bytes=0,
+                size_gb=0.0,
+                expected_size_gb=0.0,
+            )
+
         files = self.refresh_available_files()
         text_encoder_path = files["text_encoder"]
         exists = text_encoder_path is not None
@@ -64,6 +76,12 @@ class ModelsHandler(StateHandlerBase):
         )
 
     def get_models_list(self) -> list[ModelInfo]:
+        if self._config.wangp_enabled:
+            return [
+                ModelInfo(id="fast", name="Fast (WanGP LTX-2.3 Distilled)", description="WanGP bridge, 8 steps"),
+                ModelInfo(id="pro", name="Pro (WanGP LTX-2.3 Distilled)", description="WanGP bridge, configurable steps"),
+            ]
+
         pro_steps = self.state.app_settings.pro_model.steps
         pro_upscaler = self.state.app_settings.pro_model.use_upscaler
         return [
@@ -76,6 +94,34 @@ class ModelsHandler(StateHandlerBase):
         ]
 
     def get_models_status(self, has_api_key: bool | None = None) -> ModelsStatusResponse:
+        if self._config.wangp_enabled:
+            status = self._wangp_bridge.get_status()
+            root_label = str(status.root) if status.root is not None else str(self._config.wangp_config_dir)
+            reason = status.reason if not status.available else "Uses external WanGP installation"
+            return ModelsStatusResponse(
+                models=[
+                    ModelFileStatus(
+                        name="WanGP Bridge",
+                        description=reason or "WanGP bridge",
+                        downloaded=status.available,
+                        size=0,
+                        expected_size=0,
+                        required=True,
+                        is_folder=True,
+                        optional_reason=None,
+                    )
+                ],
+                all_downloaded=status.available,
+                total_size=0,
+                downloaded_size=0,
+                total_size_gb=0.0,
+                downloaded_size_gb=0.0,
+                models_path=root_label,
+                has_api_key=False,
+                text_encoder_status=self.get_text_encoder_status(),
+                use_local_text_encoder=False,
+            )
+
         files = self.refresh_available_files()
         settings = self.state.app_settings.model_copy(deep=True)
 

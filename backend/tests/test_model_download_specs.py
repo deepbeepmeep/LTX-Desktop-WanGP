@@ -29,6 +29,13 @@ def _build_config(tmp_path):
         use_sage_attention=False,
         camera_motion_prompts={},
         default_negative_prompt="",
+        wangp_enabled=False,
+        wangp_root=None,
+        wangp_python=None,
+        wangp_config_dir=tmp_path / "wangp_bridge",
+        wangp_video_model_type="ltx2_22B_distilled",
+        wangp_image_model_type="z_image",
+        wangp_extra_args=(),
     )
 
 

@@ -13,8 +13,10 @@ The installer includes:
   - PyTorch (CUDA on Windows, MPS on macOS)
   - FastAPI, Diffusers, Transformers
   - LTX-2 inference packages
+  - Wan2GP runtime deps on Windows
   - All other required libraries
 - **Backend Python code**
+- **Wan2GP source checkout** in `resources/Wan2GP` for Windows local generation
 
 **NOT bundled** (downloaded at runtime):
 - Model weights (downloaded on first run; can be large) from Hugging Face
@@ -51,9 +53,10 @@ pnpm build:win
 This will:
 1. Download a standalone Python distribution (version from [`backend/.python-version`](../backend/.python-version))
 2. Install all Python dependencies (~10GB on Windows with CUDA, ~2-3GB on macOS with MPS)
-3. Build the frontend
-4. Package everything with electron-builder
-5. Create a DMG (macOS) or NSIS installer (Windows) in the `release/` folder
+3. Ensure a `Wan2GP/` checkout exists in the repo root
+4. Build the frontend
+5. Package everything with electron-builder
+6. Create a DMG (macOS) or NSIS installer (Windows) in the `release/` folder
 
 ## Build Options
 

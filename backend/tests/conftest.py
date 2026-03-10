@@ -63,6 +63,13 @@ def test_state(tmp_path: Path, fake_services: FakeServices):
         use_sage_attention=False,
         camera_motion_prompts=CAMERA_MOTION_PROMPTS,
         default_negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+        wangp_enabled=False,
+        wangp_root=None,
+        wangp_python=None,
+        wangp_config_dir=app_data / "wangp_bridge",
+        wangp_video_model_type="ltx2_22B_distilled",
+        wangp_image_model_type="z_image",
+        wangp_extra_args=(),
     )
 
     bundle = ServiceBundle(

@@ -50,6 +50,13 @@ if (-not $UvExe) {
 }
 Write-Host "uv: $UvExe" -ForegroundColor Green
 
+Write-Host "`nEnsuring Wan2GP checkout..." -ForegroundColor Yellow
+& "$ScriptDir\ensure-wan2gp.ps1"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Wan2GP checkout setup failed!" -ForegroundColor Red
+    exit 1
+}
+
 # ============================================================
 # Step 2: Generate requirements.txt from uv.lock
 # ============================================================
@@ -149,6 +156,14 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "All dependencies installed" -ForegroundColor Green
+
+Write-Host "`nInstalling Wan2GP dependencies..." -ForegroundColor Yellow
+& "$ScriptDir\ensure-wan2gp.ps1" -InstallPythonDeps -PythonExe $PythonExe
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Wan2GP dependency install failed!" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Wan2GP dependencies installed" -ForegroundColor Green
 
 # ============================================================
 # Step 7: Copy Python headers for Triton/SageAttention JIT

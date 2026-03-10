@@ -29,6 +29,17 @@ extraResources:
       - "!outputs/**"
       - "!models/**"
       - "!tests/**"
+  - from: Wan2GP
+    to: Wan2GP
+    filter:
+      - "**/*"
+      - "!**/.git/**"
+      - "!**/.venv/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!ckpts/**"
+      - "!outputs/**"
+      - "!release/**"
   - from: python-deps-hash.txt
     to: python-deps-hash.txt
 

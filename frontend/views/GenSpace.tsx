@@ -777,6 +777,7 @@ const DEFAULT_VIDEO_SETTINGS = {
   fps: 24,
   aspectRatio: '16:9',
   imageResolution: '1080p',
+  imageSteps: 8,
   variations: 1,
   audio: true,
 }
@@ -807,7 +808,7 @@ export function GenSpace() {
   } | null>(null)
   const [settings, setSettings] = useState(() => ({ ...DEFAULT_VIDEO_SETTINGS }))
   const applyForcedVideoSettings = useCallback(
-    (next: { model: string; duration: number; videoResolution: string; fps: number; audio: boolean; aspectRatio: string; imageResolution: string; variations: number }) => {
+    (next: { model: string; duration: number; videoResolution: string; fps: number; audio: boolean; aspectRatio: string; imageResolution: string; imageSteps: number; variations: number }) => {
       if (!shouldVideoGenerateWithLtxApi || mode !== 'video') return next
       return sanitizeForcedApiVideoSettings(next, { hasAudio: !!inputAudio })
     },
@@ -945,7 +946,7 @@ export function GenSpace() {
             audio: savedVideoSettings.audio || false,
             cameraMotion: 'none',
             imageAspectRatio: savedVideoSettings.aspectRatio,
-            imageSteps: 4,
+            imageSteps: savedVideoSettings.imageSteps,
             inputImageUrl: inputImage || undefined,
             inputAudioUrl: inputAudio || undefined,
           },
@@ -1057,7 +1058,7 @@ export function GenSpace() {
                 audio: false,
                 cameraMotion: 'none',
                 imageAspectRatio: settings.aspectRatio,
-                imageSteps: 4,
+                imageSteps: settings.imageSteps,
               },
               takes: [{
                 url: finalUrl,
@@ -1111,7 +1112,7 @@ export function GenSpace() {
           cameraMotion: 'none',
           imageResolution: settings.imageResolution,
           imageAspectRatio: settings.aspectRatio,
-          imageSteps: 4,
+          imageSteps: settings.imageSteps,
           variations: settings.variations,
         }
       )
@@ -1136,7 +1137,7 @@ export function GenSpace() {
           aspectRatio: videoSettings.aspectRatio,
           imageResolution: videoSettings.imageResolution,
           imageAspectRatio: videoSettings.aspectRatio,
-          imageSteps: 4,
+          imageSteps: videoSettings.imageSteps,
         },
         audioPath,
       )

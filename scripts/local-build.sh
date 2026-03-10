@@ -81,6 +81,10 @@ cd "$PROJECT_DIR"
 echo "Platform: $PLATFORM"
 echo ""
 
+echo "[0/4] Ensuring Wan2GP checkout..."
+bash "$SCRIPT_DIR/ensure-wan2gp.sh"
+echo ""
+
 # ============================================================
 # Step 0: Clean if requested
 # ============================================================

@@ -20,6 +20,7 @@ from handlers.base import StateHandlerBase
 from handlers.generation_handler import GenerationHandler
 from handlers.pipelines_handler import PipelinesHandler
 from handlers.text_handler import TextHandler
+from services.wangp_bridge import WanGPBridge
 from server_utils.media_validation import (
     normalize_optional_path,
     validate_audio_file,
@@ -67,6 +68,7 @@ class VideoGenerationHandler(StateHandlerBase):
         config: RuntimeConfig,
         camera_motion_prompts: dict[str, str],
         default_negative_prompt: str,
+        wangp_bridge: WanGPBridge,
     ) -> None:
         super().__init__(state, lock)
         self._generation = generation_handler
@@ -77,8 +79,12 @@ class VideoGenerationHandler(StateHandlerBase):
         self._config = config
         self._camera_motion_prompts = camera_motion_prompts
         self._default_negative_prompt = default_negative_prompt
+        self._wangp_bridge = wangp_bridge
 
     def generate(self, req: GenerateVideoRequest) -> GenerateVideoResponse:
+        if self._config.wangp_enabled:
+            return self._generate_via_wangp(req)
+
         if should_video_generate_with_ltx_api(
             force_api_generations=self._config.force_api_generations,
             settings=self.state.app_settings,
@@ -532,6 +538,51 @@ class VideoGenerationHandler(StateHandlerBase):
         output_path = self._make_output_path()
         output_path.write_bytes(video_bytes)
         return output_path
+
+    def _generate_via_wangp(self, req: GenerateVideoRequest) -> GenerateVideoResponse:
+        if self._generation.is_generation_running():
+            raise HTTPError(409, "Generation already in progress")
+
+        generation_id = self._make_generation_id()
+        self._generation.start_api_generation(generation_id)
+
+        duration = self._parse_forced_numeric_field(req.duration, "INVALID_DURATION")
+        fps = self._parse_forced_numeric_field(req.fps, "INVALID_FPS")
+        image_path = normalize_optional_path(req.imagePath)
+        audio_path = normalize_optional_path(req.audioPath)
+
+        try:
+            validated_image_path = str(validate_image_file(image_path)) if image_path else None
+            validated_audio_path = str(validate_audio_file(audio_path)) if audio_path else None
+
+            settings = self.state.app_settings.model_copy(deep=True)
+            steps = 8 if req.model.strip().lower() == "fast" else max(1, settings.pro_model.steps)
+            seed = self._resolve_seed()
+
+            output_path = self._wangp_bridge.generate_video(
+                prompt=req.prompt,
+                resolution_label=req.resolution,
+                aspect_ratio=req.aspectRatio,
+                duration_seconds=duration,
+                fps=fps,
+                steps=steps,
+                seed=seed,
+                camera_motion=req.cameraMotion,
+                negative_prompt=req.negativePrompt,
+                image_path=validated_image_path,
+                audio_path=validated_audio_path,
+                on_progress=self._generation.update_progress,
+                is_cancelled=self._generation.is_generation_cancelled,
+            )
+
+            self._generation.complete_generation(output_path)
+            return GenerateVideoResponse(status="complete", video_path=output_path)
+        except Exception as e:
+            self._generation.fail_generation(str(e))
+            if "cancelled" in str(e).lower():
+                logger.info("WanGP generation cancelled by user")
+                return GenerateVideoResponse(status="cancelled")
+            raise HTTPError(500, str(e)) from e
 
     @staticmethod
     def _parse_forced_numeric_field(raw_value: str, error_detail: str) -> int:
