@@ -1,17 +1,17 @@
 # LTX Desktop
 
-LTX Desktop is an open-source desktop app for generating videos with LTX models — locally on supported Windows NVIDIA GPUs, with an API mode for unsupported hardware and macOS.
+LTX Desktop is an open-source desktop app for generating videos with LTX models - locally on supported Windows NVIDIA GPUs and on Linux source/dev setups backed by WanGP, with an API mode for unsupported hardware and macOS.
 
 > **Status: Beta.** Expect breaking changes.
 > Frontend architecture is under active refactor; large UI PRs may be declined for now (see [`CONTRIBUTING.md`](docs/CONTRIBUTING.md)).
 
 **This LTX Desktop fork powered by WanGP reduces the VRAM requirements from 32 GB to 6 GB.**
 
-check WanGP repo for more information (doc, discord, ...): https://github.com/deepbeepmeep/Wan2GP
+Check the WanGP repo for more information (docs, Discord, and more): https://github.com/deepbeepmeep/Wan2GP
 
 ## Windows WanGP Quick Start
 
-Use one of these two setup paths for local WanGP-backed generation on Windows:
+Use one of these two setup paths for local WanGP-backed generation on Windows.
 
 Before running any `pnpm` command, make sure `pnpm` is installed and available in `PATH`.
 
@@ -102,6 +102,29 @@ setx WANGP_ROOT D:\Wan2GP
 [Environment]::SetEnvironmentVariable("WANGP_ROOT", "D:\Wan2GP", "User")
 ```
 
+## Linux WanGP Quick Start
+
+Linux support in this fork currently targets running from source/dev with WanGP. This README does not claim an official packaged Linux release for the fork.
+
+Prerequisites:
+
+- Node.js 18+
+- `pnpm`
+- `uv`
+- `git`
+- NVIDIA GPU with CUDA support
+- `ffmpeg`
+
+If you already have a Wan2GP checkout, point `WANGP_ROOT` to it before setup:
+
+```bash
+export WANGP_ROOT=/path/to/Wan2GP
+pnpm setup:dev:linux
+pnpm dev
+```
+
+If `WANGP_ROOT` is not set, `pnpm setup:dev:linux` will prepare a repo-local `Wan2GP/` checkout for you.
+
 <p align="center">
   <img src="images/gen-space.png" alt="Gen Space" width="70%">
 </p>
@@ -127,10 +150,11 @@ setx WANGP_ROOT D:\Wan2GP
 
 | Platform / hardware | Generation mode | Notes |
 | --- | --- | --- |
-| Windows + CUDA GPU with **~~≥32GB VRAM~~** As low 6GB VRAM with WanGP | Local generation | Downloads model weights locally |
-| Windows (no CUDA, <32GB VRAM, or unknown VRAM) | API-only | **LTX API key required** |
+| Windows + CUDA GPU with **as low as 6 GB VRAM with WanGP** | Local generation | Downloads model weights locally |
+| Windows (no CUDA, low VRAM, or unknown VRAM) | API-only | **LTX API key required** |
 | macOS (Apple Silicon builds) | API-only | **LTX API key required** |
-| Linux | Not officially supported | No official builds |
+| Linux + CUDA GPU + WanGP checkout | Local generation | Source/dev setup supported in this fork |
+| Linux without WanGP bridge | API-only | **LTX API key required** |
 
 In API-only mode, available resolutions/durations may be limited to what the API supports.
 
@@ -139,8 +163,8 @@ In API-only mode, available resolutions/durations may be limited to what the API
 ### Windows (local generation)
 
 - Windows 10/11 (x64)
-- NVIDIA GPU with CUDA support and **~~≥32GB VRAM~~** As low 6GB VRAM with WanGP
-- 16GB+ RAM (32GB recommended)
+- NVIDIA GPU with CUDA support and as low as 6 GB VRAM with WanGP
+- 16 GB+ RAM (32 GB recommended)
 - Plenty of free disk space for model weights and outputs
 
 ### macOS (API-only)
@@ -149,11 +173,18 @@ In API-only mode, available resolutions/durations may be limited to what the API
 - macOS 13+ (Ventura)
 - Stable internet connection
 
+### Linux (source/dev with WanGP)
+
+- Modern x64 Linux distribution
+- NVIDIA GPU with CUDA support
+- `ffmpeg`
+- A Wan2GP checkout available locally or via `WANGP_ROOT`
+
 ## Install
 
-1. Download the latest installer from GitHub Releases: [Releases](../../releases)
-2. Install and launch **LTX Desktop**
-3. Complete first-run setup
+1. Windows: download the latest installer from GitHub Releases: [Releases](../../releases)
+2. Linux: use the source/dev setup described in **Linux WanGP Quick Start** or **Development (quickstart)**
+3. Launch **LTX Desktop** and complete first-run setup
 
 ## First run & data locations
 
@@ -161,15 +192,16 @@ LTX Desktop stores app data (settings, models, logs) in:
 
 - **Windows:** `%LOCALAPPDATA%\LTXDesktop\`
 - **macOS:** `~/Library/Application Support/LTXDesktop/`
+- **Linux:** `$XDG_DATA_HOME/LTXDesktop/` or `~/.local/share/LTXDesktop/`
 
 Model weights are downloaded into the `models/` subfolder (this can be large and may take time).
 
-On first launch you may be prompted to review/accept model license terms (license text is fetched from Hugging Face; requires internet).
+On first launch you may be prompted to review or accept model license terms (license text is fetched from Hugging Face and requires internet).
 
 Text encoding: to generate videos you must configure text encoding:
 
-- **LTX API key** (cloud text encoding) — **text encoding via the API is completely FREE** and highly recommended to speed up inference and save memory. Generate a free API key at the [LTX Console](https://console.ltx.video/). [Read more](https://ltx.io/model/model-blog/ltx-2-better-control-for-real-workflows).
-- **Local Text Encoder** (extra download; enables fully-local operation on supported Windows hardware) — if you don't wish to generate an API key, you can encode text locally via the settings menu.
+- **LTX API key** (cloud text encoding) - **text encoding via the API is completely free** and highly recommended to speed up inference and save memory. Generate a free API key at the [LTX Console](https://console.ltx.video/). [Read more](https://ltx.io/model/model-blog/ltx-2-better-control-for-real-workflows).
+- **Local Text Encoder** (extra download; enables fully local operation on supported Windows and Linux WanGP setups) - if you do not wish to generate an API key, you can encode text locally via the settings menu.
 
 ## API keys, cost, and privacy
 
@@ -177,15 +209,15 @@ Text encoding: to generate videos you must configure text encoding:
 
 The LTX API is used for:
 
-- **Cloud text encoding and prompt enhancement** — **FREE**; text encoding is highly recommended to speed up inference and save memory
-- API-based video generations (required on macOS and on unsupported Windows hardware) — paid
-- Retake — paid
+- **Cloud text encoding and prompt enhancement** - **free**; text encoding is highly recommended to speed up inference and save memory
+- API-based video generations (required on macOS and on unsupported Windows/Linux hardware) - paid
+- Retake - paid
 
-An LTX API key is required in API-only mode, but optional on Windows local mode if you enable the Local Text Encoder.
+An LTX API key is required in API-only mode, but optional on Windows and Linux local WanGP mode if you enable the Local Text Encoder.
 
-Generate a FREE API key at the [LTX Console](https://console.ltx.video/). Text encoding is free; video generation API usage is paid. [Read more](https://ltx.io/model/model-blog/ltx-2-better-control-for-real-workflows).
+Generate a free API key at the [LTX Console](https://console.ltx.video/). Text encoding is free; video generation API usage is paid. [Read more](https://ltx.io/model/model-blog/ltx-2-better-control-for-real-workflows).
 
-When you use API-backed features, prompts and media inputs are sent to the API service. Your API key is stored locally in your app data folder — treat it like a secret.
+When you use API-backed features, prompts and media inputs are sent to the API service. Your API key is stored locally in your app data folder - treat it like a secret.
 
 ### fal API key (optional)
 
@@ -202,14 +234,14 @@ Used for AI prompt suggestions. When enabled, prompt context and frames may be s
 LTX Desktop is split into three main layers:
 
 - **Renderer (`frontend/`)**: TypeScript + React UI.
-  - Calls the local backend over HTTP at `http://localhost:8000`.
-  - Talks to Electron via the preload bridge (`window.electronAPI`).
+  Calls the local backend over HTTP at `http://localhost:8000`.
+  Talks to Electron via the preload bridge (`window.electronAPI`).
 - **Electron (`electron/`)**: TypeScript main process + preload.
-  - Owns app lifecycle and OS integration (file dialogs, native export via ffmpeg, starting/managing the Python backend).
-  - Security: renderer is sandboxed (`contextIsolation: true`, `nodeIntegration: false`).
+  Owns app lifecycle and OS integration (file dialogs, native export via ffmpeg, starting/managing the Python backend).
+  Security: renderer is sandboxed (`contextIsolation: true`, `nodeIntegration: false`).
 - **Backend (`backend/`)**: Python + FastAPI local server.
-  - Orchestrates generation, model downloads, and GPU execution.
-  - Calls external APIs only when API-backed features are used.
+  Orchestrates generation, model downloads, and GPU execution.
+  Calls external APIs only when API-backed features are used.
 
 ```mermaid
 graph TD
@@ -237,11 +269,14 @@ Setup:
 # macOS
 pnpm setup:dev:mac
 
+# Linux
+pnpm setup:dev:linux
+
 # Windows
 pnpm setup:dev:win
 ```
 
-On Windows, `pnpm setup:dev:win` installs Wan2GP Python dependencies into the backend venv used by LTX Desktop. By default it clones `https://github.com/deepbeepmeep/Wan2GP` into the repo subfolder `Wan2GP/`, but if no local subfolder exists and `WANGP_ROOT` points to an existing checkout, it reuses that checkout instead. A repo-local `Wan2GP/` remains directly usable on its own if you want to run Wan2GP from the subfolder.
+On Windows and Linux, the WanGP-backed path uses the LTX Desktop backend venv plus either a repo-local `Wan2GP/` checkout or an existing checkout pointed to by `WANGP_ROOT`. A repo-local `Wan2GP/` remains directly usable on its own if you want to run Wan2GP from the subfolder.
 
 Run:
 
@@ -278,10 +313,10 @@ LTX Desktop collects minimal, anonymous usage analytics (app version, platform, 
 
 ## Docs
 
-- [`INSTALLER.md`](docs/INSTALLER.md) — building installers
-- [`TELEMETRY.md`](docs/TELEMETRY.md) — telemetry and privacy
-- [`backend/architecture.md`](backend/architecture.md) — backend architecture
-- [`backend/WANGP_BACKEND.md`](backend/WANGP_BACKEND.md) — WanGP bridge configuration
+- [`INSTALLER.md`](docs/INSTALLER.md) - building installers
+- [`TELEMETRY.md`](docs/TELEMETRY.md) - telemetry and privacy
+- [`backend/architecture.md`](backend/architecture.md) - backend architecture
+- [`backend/WANGP_BACKEND.md`](backend/WANGP_BACKEND.md) - WanGP bridge configuration
 
 ## Contributing
 
@@ -289,7 +324,7 @@ See [`CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0 — see [`LICENSE.txt`](LICENSE.txt).
+Apache-2.0 - see [`LICENSE.txt`](LICENSE.txt).
 
 Third-party notices (including model licenses/terms): [`NOTICES.md`](NOTICES.md).
 

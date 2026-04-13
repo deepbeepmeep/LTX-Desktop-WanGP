@@ -10,6 +10,7 @@
   "packageManager": "pnpm@10.30.3",
   "scripts": {
     "setup:dev:mac": "bash scripts/setup-dev.sh",
+    "setup:dev:linux": "bash scripts/setup-dev.sh",
     "setup:dev:win": "powershell -ExecutionPolicy Bypass -File scripts/setup-dev.ps1",
     "dev": "vite",
     "dev:debug": "cross-env BACKEND_DEBUG=1 ELECTRON_DEBUG=1 vite",

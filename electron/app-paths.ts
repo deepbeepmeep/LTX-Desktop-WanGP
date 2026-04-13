@@ -18,7 +18,8 @@ function resolveUserDataPath(): string {
       APP_FOLDER_NAME,
     )
   }
-  return path.join(os.homedir(), `.${APP_FOLDER_NAME}`)
+  const xdgData = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share')
+  return path.join(xdgData, APP_FOLDER_NAME)
 }
 
 app.setPath('userData', resolveUserDataPath())

@@ -219,7 +219,7 @@ IC_LORA_DIR.mkdir(parents=True, exist_ok=True)
 
 LTX_API_BASE_URL = "https://api.ltx.video"
 WANGP_ROOT = _resolve_wangp_root()
-WANGP_ENABLED = platform.system() == "Windows" and WANGP_ROOT is not None
+WANGP_ENABLED = platform.system() in ("Windows", "Linux") and WANGP_ROOT is not None
 WANGP_PYTHON = _resolve_wangp_python(WANGP_ROOT) if WANGP_ENABLED else None
 WANGP_CONFIG_DIR = APP_DATA_DIR / "wangp_bridge"
 WANGP_VIDEO_MODEL_TYPE = os.environ.get("WANGP_VIDEO_MODEL_TYPE", "ltx2_22B_distilled")
