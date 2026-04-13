@@ -70,7 +70,15 @@ class WanGPBridge:
         self._camera_motion_prompts = camera_motion_prompts
         self._extra_args = tuple(extra_args)
         self._session = None
+        self._submitted_manifest_once = False
         self._session_lock = threading.Lock()
+
+    def _resolve_session_config_path(self) -> Path:
+        if self._root is not None:
+            root_config = self._root / "wgp_config.json"
+            if root_config.exists():
+                return root_config
+        return self._config_dir / "wgp_config.json"
 
     def get_status(self) -> WanGPBridgeStatus:
         if not self._enabled:
@@ -285,7 +293,7 @@ class WanGPBridge:
                 api_module = self._load_api_module()
                 self._session = api_module.WanGPSession(
                     root=status.root,
-                    config_path=self._config_dir / "wgp_config.json",
+                    config_path=self._resolve_session_config_path(),
                     output_dir=self._output_dir,
                     cli_args=self._extra_args,
                 )
@@ -303,7 +311,9 @@ class WanGPBridge:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._config_dir.mkdir(parents=True, exist_ok=True)
 
-        on_progress("validating_request", 2, None, None)
+        startup_phase = "starting_wangp" if not self._submitted_manifest_once else "validating_request"
+        self._submitted_manifest_once = True
+        on_progress(startup_phase, 2, None, None)
         job = session.submit_manifest(manifest)
         error_lines: deque[str] = deque(maxlen=40)
         cancel_requested = False
@@ -508,6 +518,7 @@ class WanGPBridge:
     @staticmethod
     def _phase_label(phase: str) -> str:
         labels = {
+            "starting_wangp": "Starting WanGP",
             "preparing_model": "Preparing model",
             "downloading_model": "Downloading model",
             "loading_model": "Loading model",

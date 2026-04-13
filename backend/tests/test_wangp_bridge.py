@@ -74,3 +74,44 @@ def test_ltx2_video_uses_full_video_length_as_sliding_window_size() -> None:
     assert output == "E:/tmp/out.mp4"
     assert captured["settings"]["video_length"] == 145
     assert captured["settings"]["sliding_window_size"] == 145
+
+
+def test_bridge_prefers_root_wgp_config_when_present(tmp_path: Path) -> None:
+    root = tmp_path / "wangp-root"
+    root.mkdir()
+    root_config = root / "wgp_config.json"
+    root_config.write_text("{}", encoding="utf-8")
+
+    bridge = WanGPBridge(
+        enabled=True,
+        root=root,
+        python_executable=None,
+        config_dir=tmp_path / "wangp_bridge",
+        output_dir=tmp_path / "wangp_outputs",
+        video_model_type="ltx2_22B_distilled",
+        image_model_type="z_image",
+        camera_motion_prompts={},
+        extra_args=(),
+    )
+
+    assert bridge._resolve_session_config_path() == root_config
+
+
+def test_bridge_falls_back_to_bridge_config_when_root_config_missing(tmp_path: Path) -> None:
+    root = tmp_path / "wangp-root"
+    root.mkdir()
+    config_dir = tmp_path / "wangp_bridge"
+
+    bridge = WanGPBridge(
+        enabled=True,
+        root=root,
+        python_executable=None,
+        config_dir=config_dir,
+        output_dir=tmp_path / "wangp_outputs",
+        video_model_type="ltx2_22B_distilled",
+        image_model_type="z_image",
+        camera_motion_prompts={},
+        extra_args=(),
+    )
+
+    assert bridge._resolve_session_config_path() == config_dir / "wgp_config.json"

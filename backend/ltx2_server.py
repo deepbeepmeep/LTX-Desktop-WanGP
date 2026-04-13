@@ -144,13 +144,6 @@ def _resolve_wangp_root() -> Path | None:
     candidates: list[Path] = []
     search_roots = [PROJECT_ROOT, *PROJECT_ROOT.parents]
 
-    # Prefer the bundled checkout that ships with the desktop app over any
-    # unrelated global environment variable from older local experiments.
-    for base in search_roots:
-        candidates.append(base)
-        for sibling_name in ("Wan2GP", "WanGP", "wan2gp", "wangp"):
-            candidates.append(base / sibling_name)
-
     for env_key in ("WANGP_ROOT", "WANGP_WGP_PATH"):
         raw_value = os.environ.get(env_key, "").strip()
         if not raw_value:
@@ -159,6 +152,13 @@ def _resolve_wangp_root() -> Path | None:
         if candidate.is_file():
             candidate = candidate.parent
         candidates.append(candidate)
+
+    # Fall back to bundled/sibling checkouts only when no explicit WanGP root
+    # was provided in the environment.
+    for base in search_roots:
+        candidates.append(base)
+        for sibling_name in ("Wan2GP", "WanGP", "wan2gp", "wangp"):
+            candidates.append(base / sibling_name)
 
     seen: set[Path] = set()
     for candidate in candidates:

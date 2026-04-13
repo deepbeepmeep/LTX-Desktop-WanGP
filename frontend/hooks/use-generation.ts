@@ -66,6 +66,8 @@ function getImageDimensions(settings: GenerationSettings): { width: number; heig
 // Map phase to user-friendly message
 function getPhaseMessage(phase: string): string {
   switch (phase) {
+    case 'starting_wangp':
+      return 'Starting WanGP...'
     case 'validating_request':
       return 'Validating request...'
     case 'uploading_image':
