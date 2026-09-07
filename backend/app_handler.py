@@ -10,12 +10,16 @@ from handlers import (
     DownloadHandler,
     GenerationHandler,
     HealthHandler,
+    HuggingFaceAuthHandler,
     IcLoraHandler,
     ImageGenerationHandler,
     ModelsHandler,
     PipelinesHandler,
+    LoraCatalogHandler,
+    PromptEnhancementHandler,
     SuggestGapPromptHandler,
     RetakeHandler,
+    ExtendHandler,
     RuntimePolicyHandler,
     SettingsHandler,
     TextHandler,
@@ -25,22 +29,26 @@ from runtime_config.runtime_config import RuntimeConfig
 from services.wangp_bridge import WanGPBridge
 from services.interfaces import (
     A2VPipeline,
+    DepthProcessorPipeline,
     FastVideoPipeline,
     ZitAPIClient,
     ImageGenerationPipeline,
     GpuCleaner,
     GpuInfo,
     HTTPClient,
-    IcLoraModelDownloader,
     IcLoraPipeline,
     LTXAPIClient,
     ModelDownloader,
+    PoseProcessorPipeline,
+    PromptEnhancerPipeline,
     RetakePipeline,
     TaskRunner,
     TextEncoder,
     VideoProcessor,
 )
-from state.app_state_types import AppState, StartupPending, TextEncoderState
+from services.lora_catalog import LoraCatalogProvider
+from services.prompt_enhancer_pipeline.gemini_prompt_enhancer_pipeline import GeminiPromptEnhancerPipeline
+from state.app_state_types import AppState, TextEncoderState
 
 
 class AppHandler:
@@ -53,6 +61,7 @@ class AppHandler:
         http: HTTPClient,
         gpu_cleaner: GpuCleaner,
         model_downloader: ModelDownloader,
+        lora_catalog_provider: LoraCatalogProvider,
         gpu_info: GpuInfo,
         video_processor: VideoProcessor,
         text_encoder: TextEncoder,
@@ -62,9 +71,11 @@ class AppHandler:
         fast_video_pipeline_class: type[FastVideoPipeline],
         image_generation_pipeline_class: type[ImageGenerationPipeline],
         ic_lora_pipeline_class: type[IcLoraPipeline],
+        depth_processor_pipeline_class: type[DepthProcessorPipeline],
+        pose_processor_pipeline_class: type[PoseProcessorPipeline],
         a2v_pipeline_class: type[A2VPipeline],
         retake_pipeline_class: type[RetakePipeline],
-        ic_lora_model_downloader: IcLoraModelDownloader,
+        prompt_enhancer_pipeline_class: type[PromptEnhancerPipeline],
     ) -> None:
         self.config = config
 
@@ -80,9 +91,12 @@ class AppHandler:
         self.fast_video_pipeline_class = fast_video_pipeline_class
         self.image_generation_pipeline_class = image_generation_pipeline_class
         self.ic_lora_pipeline_class = ic_lora_pipeline_class
+        self.depth_processor_pipeline_class = depth_processor_pipeline_class
+        self.pose_processor_pipeline_class = pose_processor_pipeline_class
         self.a2v_pipeline_class = a2v_pipeline_class
         self.retake_pipeline_class = retake_pipeline_class
         self.ic_lora_model_downloader = ic_lora_model_downloader
+        self.prompt_enhancer_pipeline_class = prompt_enhancer_pipeline_class
         self.wangp_bridge = WanGPBridge(
             enabled=config.wangp_enabled,
             root=config.wangp_root,
@@ -98,18 +112,11 @@ class AppHandler:
         self._lock = threading.RLock()
 
         self.state = AppState(
-            available_files={
-                "checkpoint": None,
-                "upsampler": None,
-                "text_encoder": None,
-                "zit": None,
-            },
             downloading_session=None,
             gpu_slot=None,
-            api_generation=None,
+            active_generation=None,
             cpu_slot=None,
             text_encoder=TextEncoderState(service=text_encoder),
-            startup=StartupPending(message="Not started"),
             app_settings=default_settings.model_copy(deep=True),
         )
 
@@ -120,21 +127,37 @@ class AppHandler:
         self.settings = SettingsHandler(
             state=self.state,
             lock=self._lock,
-            settings_file=config.settings_file,
+            config=config,
+            http=http,
         )
-        self.settings.load_settings(default_settings)
 
         self.models = ModelsHandler(
             state=self.state,
             lock=self._lock,
             config=config,
             wangp_bridge=self.wangp_bridge,
+            settings_handler=self.settings,
+        )
+
+        self.hf_auth = HuggingFaceAuthHandler(
+            state=self.state,
+            lock=self._lock,
+            config=config,
         )
 
         self.downloads = DownloadHandler(
             state=self.state,
             lock=self._lock,
             models_handler=self.models,
+            model_downloader=model_downloader,
+            task_runner=task_runner,
+            config=config,
+        )
+
+        self.catalog = LoraCatalogHandler(
+            state=self.state,
+            lock=self._lock,
+            catalog=lora_catalog_provider,
             model_downloader=model_downloader,
             task_runner=task_runner,
             config=config,
@@ -154,14 +177,28 @@ class AppHandler:
             fast_video_pipeline_class=fast_video_pipeline_class,
             image_generation_pipeline_class=image_generation_pipeline_class,
             ic_lora_pipeline_class=ic_lora_pipeline_class,
+            depth_processor_pipeline_class=depth_processor_pipeline_class,
+            pose_processor_pipeline_class=pose_processor_pipeline_class,
             a2v_pipeline_class=a2v_pipeline_class,
             retake_pipeline_class=retake_pipeline_class,
             config=config,
-            outputs_dir=config.outputs_dir,
-            device=config.device,
         )
 
-        self.generation = GenerationHandler(state=self.state, lock=self._lock)
+        self.generation = GenerationHandler(state=self.state, lock=self._lock, config=config)
+
+        # Before video generation: local text encoding has no server-side rewrite step, so the
+        # generation path runs this enhancer itself.
+        self.prompt_enhancement = PromptEnhancementHandler(
+            state=self.state,
+            lock=self._lock,
+            generation_handler=self.generation,
+            pipelines_handler=self.pipelines,
+            text_handler=self.text,
+            lora_catalog_provider=lora_catalog_provider,
+            prompt_enhancer_pipeline_class=prompt_enhancer_pipeline_class,
+            gemini_pipeline=GeminiPromptEnhancerPipeline(http),
+            config=config,
+        )
 
         self.video_generation = VideoGenerationHandler(
             state=self.state,
@@ -169,11 +206,9 @@ class AppHandler:
             generation_handler=self.generation,
             pipelines_handler=self.pipelines,
             text_handler=self.text,
+            prompt_enhancement_handler=self.prompt_enhancement,
             ltx_api_client=ltx_api_client,
-            outputs_dir=config.outputs_dir,
             config=config,
-            camera_motion_prompts=config.camera_motion_prompts,
-            default_negative_prompt=config.default_negative_prompt,
             wangp_bridge=self.wangp_bridge,
         )
 
@@ -182,7 +217,6 @@ class AppHandler:
             lock=self._lock,
             generation_handler=self.generation,
             pipelines_handler=self.pipelines,
-            outputs_dir=config.outputs_dir,
             config=config,
             zit_api_client=zit_api_client,
             wangp_bridge=self.wangp_bridge,
@@ -192,10 +226,8 @@ class AppHandler:
             state=self.state,
             lock=self._lock,
             models_handler=self.models,
-            pipelines_handler=self.pipelines,
             gpu_info=gpu_info,
             config=config,
-            use_sage_attention=config.use_sage_attention,
             wangp_bridge=self.wangp_bridge,
         )
 
@@ -204,6 +236,7 @@ class AppHandler:
         self.suggest_gap_prompt = SuggestGapPromptHandler(
             state=self.state,
             lock=self._lock,
+            config=config,
             http=http,
         )
 
@@ -215,7 +248,16 @@ class AppHandler:
             generation_handler=self.generation,
             pipelines_handler=self.pipelines,
             text_handler=self.text,
-            outputs_dir=config.outputs_dir,
+        )
+
+        self.extend = ExtendHandler(
+            state=self.state,
+            lock=self._lock,
+            ltx_api_client=ltx_api_client,
+            config=config,
+            generation_handler=self.generation,
+            pipelines_handler=self.pipelines,
+            text_handler=self.text,
         )
 
         self.ic_lora = IcLoraHandler(
@@ -225,13 +267,18 @@ class AppHandler:
             pipelines_handler=self.pipelines,
             text_handler=self.text,
             video_processor=video_processor,
-            ic_lora_model_downloader=ic_lora_model_downloader,
-            ic_lora_dir=config.ic_lora_dir,
-            outputs_dir=config.outputs_dir,
+            lora_catalog=lora_catalog_provider,
+            config=config,
         )
 
         self.downloads.cleanup_downloading_dir()
-        self.models.refresh_available_files()
+
+        self.load_persistent_state(default_settings)
+
+    def load_persistent_state(self, default_settings: AppSettings) -> None:
+        """Load persisted state from disk (settings, HF auth token, etc.)."""
+        self.settings.load_settings(default_settings)
+        self.hf_auth.load_token()
 
 
 @dataclass
@@ -239,6 +286,7 @@ class ServiceBundle:
     http: HTTPClient
     gpu_cleaner: GpuCleaner
     model_downloader: ModelDownloader
+    lora_catalog_provider: LoraCatalogProvider
     gpu_info: GpuInfo
     video_processor: VideoProcessor
     text_encoder: TextEncoder
@@ -248,9 +296,11 @@ class ServiceBundle:
     fast_video_pipeline_class: type[FastVideoPipeline]
     image_generation_pipeline_class: type[ImageGenerationPipeline]
     ic_lora_pipeline_class: type[IcLoraPipeline]
+    depth_processor_pipeline_class: type[DepthProcessorPipeline]
+    pose_processor_pipeline_class: type[PoseProcessorPipeline]
     a2v_pipeline_class: type[A2VPipeline]
     retake_pipeline_class: type[RetakePipeline]
-    ic_lora_model_downloader: IcLoraModelDownloader
+    prompt_enhancer_pipeline_class: type[PromptEnhancerPipeline]
 
 
 def build_default_service_bundle(config: RuntimeConfig) -> ServiceBundle:
@@ -260,16 +310,19 @@ def build_default_service_bundle(config: RuntimeConfig) -> ServiceBundle:
     from services.gpu_cleaner.torch_cleaner import TorchCleaner
     from services.gpu_info.gpu_info_impl import GpuInfoImpl
     from services.http_client.http_client_impl import HTTPClientImpl
-    from services.ic_lora_model_downloader.ic_lora_model_downloader_impl import IcLoraModelDownloaderImpl
     from services.a2v_pipeline.ltx_a2v_pipeline import LTXa2vPipeline
+    from services.depth_processor_pipeline.midas_dpt_pipeline import MidasDPTPipeline
     from services.ic_lora_pipeline.ltx_ic_lora_pipeline import LTXIcLoraPipeline
     from services.image_generation_pipeline.zit_image_generation_pipeline import ZitImageGenerationPipeline
     from services.ltx_api_client.ltx_api_client_impl import LTXAPIClientImpl
     from services.model_downloader.hugging_face_downloader import HuggingFaceDownloader
     from services.retake_pipeline.ltx_retake_pipeline import LTXRetakePipeline
+    from services.prompt_enhancer_pipeline.ltx_prompt_enhancer_pipeline import LtxPromptEnhancerPipeline
+    from services.pose_processor_pipeline.dw_pose_pipeline import DWPosePipeline
     from services.task_runner.threading_runner import ThreadingRunner
     from services.text_encoder.ltx_text_encoder import LTXTextEncoder
     from services.video_processor.video_processor_impl import VideoProcessorImpl
+    from services.lora_catalog import FileLoraCatalogProvider
 
     http = HTTPClientImpl()
 
@@ -277,6 +330,9 @@ def build_default_service_bundle(config: RuntimeConfig) -> ServiceBundle:
         http=http,
         gpu_cleaner=TorchCleaner(device=config.device),
         model_downloader=HuggingFaceDownloader(),
+        lora_catalog_provider=FileLoraCatalogProvider(
+            config.lora_catalog_source, config.lora_catalog_fallback_path or None
+        ),
         gpu_info=GpuInfoImpl(),
         video_processor=VideoProcessorImpl(),
         text_encoder=LTXTextEncoder(
@@ -290,9 +346,11 @@ def build_default_service_bundle(config: RuntimeConfig) -> ServiceBundle:
         fast_video_pipeline_class=LTXFastVideoPipeline,
         image_generation_pipeline_class=ZitImageGenerationPipeline,
         ic_lora_pipeline_class=LTXIcLoraPipeline,
+        depth_processor_pipeline_class=MidasDPTPipeline,
+        pose_processor_pipeline_class=DWPosePipeline,
         a2v_pipeline_class=LTXa2vPipeline,
         retake_pipeline_class=LTXRetakePipeline,
-        ic_lora_model_downloader=IcLoraModelDownloaderImpl(),
+        prompt_enhancer_pipeline_class=LtxPromptEnhancerPipeline,
     )
 
 
@@ -309,6 +367,7 @@ def build_initial_state(
         http=bundle.http,
         gpu_cleaner=bundle.gpu_cleaner,
         model_downloader=bundle.model_downloader,
+        lora_catalog_provider=bundle.lora_catalog_provider,
         gpu_info=bundle.gpu_info,
         video_processor=bundle.video_processor,
         text_encoder=bundle.text_encoder,
@@ -318,7 +377,9 @@ def build_initial_state(
         fast_video_pipeline_class=bundle.fast_video_pipeline_class,
         image_generation_pipeline_class=bundle.image_generation_pipeline_class,
         ic_lora_pipeline_class=bundle.ic_lora_pipeline_class,
+        depth_processor_pipeline_class=bundle.depth_processor_pipeline_class,
+        pose_processor_pipeline_class=bundle.pose_processor_pipeline_class,
         a2v_pipeline_class=bundle.a2v_pipeline_class,
         retake_pipeline_class=bundle.retake_pipeline_class,
-        ic_lora_model_downloader=bundle.ic_lora_model_downloader,
+        prompt_enhancer_pipeline_class=bundle.prompt_enhancer_pipeline_class,
     )

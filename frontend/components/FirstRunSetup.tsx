@@ -1,6 +1,11 @@
-import { useState, useEffect } from 'react'
-import { backendFetch } from '../lib/backend'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { ApiClient, type ApiRequestBodyOf, type ApiSuccessOf } from '../lib/api-client'
+import { formatBytes } from '../lib/format'
 import { logger } from '../lib/logger'
+import { useHfAuth } from '../hooks/use-hf-auth'
+import { useHfModelAccess } from '../hooks/use-hf-model-access'
+import { useAppSettings } from '../contexts/AppSettingsContext'
+import { HfModelAccessGate } from './HfModelAccessGate'
 import './FirstRunSetup.css'
 
 interface LaunchGateProps {
@@ -11,18 +16,15 @@ interface LaunchGateProps {
 }
 
 type Step = 'license' | 'location' | 'installing' | 'complete'
-
-interface DownloadProgress {
-  status: 'idle' | 'downloading' | 'complete' | 'error'
-  currentFile: string
-  currentFileProgress: number
-  totalProgress: number
-  downloadedBytes: number
-  totalBytes: number
-  filesCompleted: number
-  totalFiles: number
-  error: string | null
-  speedMbps: number
+type StartModelDownloadBody = NonNullable<ApiRequestBodyOf<'startModelDownload'>>
+type ModelCheckpointID = NonNullable<StartModelDownloadBody['cp_ids']>[number]
+type LtxRecommendation = ApiSuccessOf<'getLtxRecommendation'>
+type ImgGenRecommendation = ApiSuccessOf<'getImgGenRecommendation'>
+type DownloadProgress = ApiSuccessOf<'getModelDownloadProgress'>
+type CheckpointDescriptor = ApiSuccessOf<'describeCheckpoints'>['checkpoints'][number]
+type DownloadStepSpec = {
+  type: StartModelDownloadBody['type']
+  cpIds: ModelCheckpointID[]
 }
 
 // Fun loading messages
@@ -37,6 +39,106 @@ const INSTALL_MESSAGES = [
   "Finalizing installation..."
 ]
 
+function uniqueCpIds(cpIds: readonly ModelCheckpointID[]): ModelCheckpointID[] {
+  return [...new Set(cpIds)]
+}
+
+// User-facing explanation per checkpoint role (moved out of the backend so wording/i18n
+// iterates without a backend deploy). Keyed by the stable `role` the backend ships.
+const CP_INFO_BY_ROLE: Record<CheckpointDescriptor['role'], string> = {
+  base: 'The core LTX video model that turns your prompt into video frames. This is the largest download.',
+  upscaler:
+    'Doubles the resolution of generated video for sharper, more detailed output. This updated version also ' +
+    'fixes glitches and stray text or overlay artifacts that could appear near the end of longer clips, and ' +
+    'keeps detail consistent through the final frames — recommended for long videos.',
+  text_encoder:
+    'Reads your text prompt so the model understands it. You can skip this large download by entering an LTX ' +
+    'API key, which encodes prompts via the API instead.',
+  vae:
+    'Decodes the model\'s latent frames into video (and audio, when present). Required for LTX versions that ' +
+    'ship the transformer separately from their VAEs.',
+  image: 'Generates still images from text prompts (used for image-to-video and image tools).',
+  support: 'A supporting model used for guided generation (depth, edges, or pose control).',
+}
+
+// One line in the first-run "What will be downloaded" list: checkpoint name, an
+// info-tooltip icon, and the size. Items an API key covers get a checkbox instead of being
+// silently dropped, so the download stays available to anyone who wants to run offline.
+function DownloadItem({
+  item,
+  optIn,
+}: {
+  item: CheckpointDescriptor
+  optIn?: { checked: boolean; onToggle: () => void }
+}) {
+  const skipped = optIn !== undefined && !optIn.checked
+  return (
+    <div
+      style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        fontSize: 13,
+        padding: '6px 0',
+        color: skipped ? '#666' : '#e0e0e0',
+        opacity: skipped ? 0.7 : 1,
+      }}
+    >
+      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        {optIn && (
+          <input
+            type="checkbox"
+            checked={optIn.checked}
+            onChange={optIn.onToggle}
+            style={{ cursor: 'pointer', accentColor: '#6D28D9' }}
+          />
+        )}
+        <span style={{ textDecoration: skipped ? 'line-through' : 'none' }}>{item.name}</span>
+        <span
+          title={CP_INFO_BY_ROLE[item.role]}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 15,
+            height: 15,
+            borderRadius: '50%',
+            border: '1px solid #6b7280',
+            color: '#9ca3af',
+            fontSize: 10,
+            fontStyle: 'italic',
+            fontFamily: 'Georgia, serif',
+            cursor: 'help',
+            flexShrink: 0,
+          }}
+        >
+          i
+        </span>
+      </span>
+      <span style={{ color: skipped ? '#666' : item.downloaded ? '#22c55e' : '#a0a0a0', flexShrink: 0, marginLeft: 12 }}>
+        {item.downloaded ? 'Installed' : skipped ? 'Skipped (API key)' : formatBytes(item.size_bytes)}
+      </span>
+    </div>
+  )
+}
+
+function buildDownloadSteps(
+  ltxRecommendation: LtxRecommendation,
+  imgGenRecommendation: ImgGenRecommendation,
+  extraCpIds: readonly ModelCheckpointID[] = [],
+): DownloadStepSpec[] {
+  const cpIds: ModelCheckpointID[] = []
+  if (ltxRecommendation.status === 'download') {
+    cpIds.push(...ltxRecommendation.cps_to_download)
+  }
+  if (imgGenRecommendation.cp_to_download) {
+    cpIds.push(imgGenRecommendation.cp_to_download)
+  }
+  cpIds.push(...extraCpIds)
+  const unique = uniqueCpIds(cpIds)
+  return unique.length > 0 ? [{ type: 'download', cpIds: unique }] : []
+}
+
 
 export function LaunchGate({
   licenseOnly,
@@ -48,24 +150,60 @@ export function LaunchGate({
   const [installPath, setInstallPath] = useState('')
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null)
   const [downloadError, setDownloadError] = useState<string | null>(null)
+  const [downloadSessionId, setDownloadSessionId] = useState<string | null>(null)
   const [installMessage, setInstallMessage] = useState(INSTALL_MESSAGES[0])
   const [availableSpace, setAvailableSpace] = useState('...')
+  const [downloadItems, setDownloadItems] = useState<CheckpointDescriptor[]>([])
+  const [optionalItems, setOptionalItems] = useState<CheckpointDescriptor[]>([])
+  const [optedInCpIds, setOptedInCpIds] = useState<ModelCheckpointID[]>([])
   const [videoPath, setVideoPath] = useState('/splash/splash.mp4')
   const [ltxApiKey, setLtxApiKey] = useState('')
+  const [hasSavedLtxApiKey, setHasSavedLtxApiKey] = useState(false)
   const [licenseAccepted, setLicenseAccepted] = useState(false)
   const [licenseText, setLicenseText] = useState<string | null>(null)
   const [licenseError, setLicenseError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [isActionPending, setIsActionPending] = useState(false)
-
-  // Format bytes to human readable
-  const formatBytes = (bytes: number): string => {
-    if (bytes === 0) return '0 B'
-    const k = 1024
-    const sizes = ['B', 'KB', 'MB', 'GB']
-    const i = Math.floor(Math.log(bytes) / Math.log(k))
-    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
+  const { hfAuthStatus, hfAuthPolling, startHuggingFaceLogin } = useHfAuth(currentStep === 'location')
+  // A key typed here isn't saved yet, so the backend still lists the text encoder as required;
+  // move it to the opt-in list so the choice reads the same either way.
+  const keyEnteredNow = ltxApiKey.trim().length > 0
+  const requiredItems = useMemo(
+    () => downloadItems.filter((item) => !(item.role === 'text_encoder' && keyEnteredNow)),
+    [downloadItems, keyEnteredNow],
+  )
+  const allOptionalItems = useMemo(
+    () => [
+      ...(keyEnteredNow ? downloadItems.filter((item) => item.role === 'text_encoder') : []),
+      ...optionalItems,
+    ],
+    [downloadItems, keyEnteredNow, optionalItems],
+  )
+  const isOptedIn = (item: CheckpointDescriptor) => optedInCpIds.includes(item.cp_id as ModelCheckpointID)
+  const toggleOptIn = (item: CheckpointDescriptor) => {
+    const cpId = item.cp_id as ModelCheckpointID
+    setOptedInCpIds((ids) => (ids.includes(cpId) ? ids.filter((id) => id !== cpId) : [...ids, cpId]))
   }
+  const pendingDownloadItems = useMemo(
+    () =>
+      [...requiredItems, ...allOptionalItems.filter((item) => optedInCpIds.includes(item.cp_id as ModelCheckpointID))]
+        .filter((item) => !item.downloaded),
+    [requiredItems, allOptionalItems, optedInCpIds],
+  )
+  const installCpIds = useMemo(
+    () => uniqueCpIds(pendingDownloadItems.map((item) => item.cp_id as ModelCheckpointID)),
+    [pendingDownloadItems],
+  )
+  const { accessMap, allAuthorized, checking: checkingAccess, checkError, recheckAccess } = useHfModelAccess(
+    currentStep === 'location' ? installCpIds : [],
+    hfAuthStatus,
+  )
+  const { saveLtxApiKey } = useAppSettings()
+  const downloadQueueRef = useRef<DownloadStepSpec[]>([])
+  const runningDownloadProgress = downloadProgress?.status === 'downloading' ? downloadProgress : null
+  const totalProgress = runningDownloadProgress?.total_progress ?? (downloadProgress?.status === 'complete' ? 100 : 0)
+
+  const totalDownloadBytes = pendingDownloadItems.reduce((sum, item) => sum + item.size_bytes, 0)
 
   // Format time remaining
   const formatTimeRemaining = (seconds: number): string => {
@@ -77,11 +215,10 @@ export function LaunchGate({
 
   // Calculate ETA based on speed and remaining bytes
   const getTimeRemaining = (): string => {
-    if (!downloadProgress || downloadProgress.speedMbps <= 0) return '--'
-    const remainingBytes = downloadProgress.totalBytes - downloadProgress.downloadedBytes
+    if (!runningDownloadProgress || runningDownloadProgress.speed_bytes_per_sec <= 0) return '--'
+    const remainingBytes = runningDownloadProgress.expected_total_bytes - runningDownloadProgress.total_downloaded_bytes
     if (remainingBytes <= 0) return '--'
-    const speedBytesPerSec = downloadProgress.speedMbps * 1024 * 1024
-    const secondsRemaining = remainingBytes / speedBytesPerSec
+    const secondsRemaining = remainingBytes / runningDownloadProgress.speed_bytes_per_sec
     return formatTimeRemaining(secondsRemaining)
   }
 
@@ -96,6 +233,69 @@ export function LaunchGate({
       setLicenseError(e instanceof Error ? e.message : 'Failed to fetch license text.')
     }
   }
+
+  const refreshModelRecommendations = useCallback(async () => {
+    if (licenseOnly) return
+
+    const [settingsResult, ltxResult, imgGenResult] = await Promise.all([
+      ApiClient.getSettings(),
+      ApiClient.getLtxRecommendation(),
+      ApiClient.getImgGenRecommendation(),
+    ])
+    if (!settingsResult.ok) {
+      logger.error(`Failed to fetch model recommendations: ${settingsResult.error.message}`)
+      return
+    }
+    if (!ltxResult.ok) {
+      logger.error(`Failed to fetch model recommendations: ${ltxResult.error.message}`)
+      return
+    }
+    if (!imgGenResult.ok) {
+      logger.error(`Failed to fetch model recommendations: ${imgGenResult.error.message}`)
+      return
+    }
+
+    setInstallPath(settingsResult.data.modelsDir ?? '')
+    setHasSavedLtxApiKey(Boolean(settingsResult.data.hasLtxApiKey))
+
+    // Surface exactly what the install will download (base model, upscaler, text
+    // encoder, image model) with per-checkpoint sizes and info. Same cp set the
+    // installer actually downloads, so the preview can't drift from reality.
+    const cpIds = buildDownloadSteps(ltxResult.data, imgGenResult.data).flatMap((step) => step.cpIds)
+    const optionalCpIds = ltxResult.data.status === 'download' ? ltxResult.data.optional_cp_ids : []
+    if (cpIds.length === 0 && optionalCpIds.length === 0) {
+      setDownloadItems([])
+      setOptionalItems([])
+      return
+    }
+    const describeResult = await ApiClient.describeCheckpoints({ cp_ids: [...cpIds, ...optionalCpIds] })
+    if (!describeResult.ok) {
+      logger.error(`Failed to describe checkpoints: ${describeResult.error.message}`)
+      return
+    }
+    const described = describeResult.data.checkpoints
+    const isOptional = (item: CheckpointDescriptor) => optionalCpIds.includes(item.cp_id)
+    setDownloadItems(described.filter((item) => !isOptional(item)))
+    setOptionalItems(described.filter(isOptional))
+  }, [licenseOnly])
+
+  const startDownloadStep = useCallback(async (step: DownloadStepSpec) => {
+    setDownloadProgress(null)
+    setDownloadError(null)
+    const result = await ApiClient.startModelDownload({
+      type: step.type,
+      cp_ids: step.cpIds,
+    })
+    if (!result.ok) {
+      throw new Error(result.error.message)
+    }
+    const downloadData = result.data
+    if (downloadData.status === 'started') {
+      setDownloadSessionId(downloadData.sessionId)
+      return
+    }
+    throw new Error('Unexpected response while starting model download.')
+  }, [])
 
   // Initialize
   useEffect(() => {
@@ -112,21 +312,7 @@ export function LaunchGate({
           setVideoPath('/splash/splash.mp4')
         }
 
-        // Get models path from backend
-        try {
-          const response = await backendFetch('/api/models/status')
-          if (response.ok) {
-            const data = await response.json()
-            if (data.models_path) {
-              setInstallPath(data.models_path)
-            }
-          }
-        } catch (e) {
-          logger.error(`Failed to get models path: ${e}`)
-        }
-
-        // TODO: Get actual available space
-        setAvailableSpace('1.8 TB')
+        await refreshModelRecommendations()
       } catch (e) {
         logger.error(`Init error: ${e}`)
       }
@@ -135,7 +321,27 @@ export function LaunchGate({
     if (showLicenseStep) {
       void fetchLicense()
     }
-  }, [showLicenseStep])
+  }, [refreshModelRecommendations, showLicenseStep])
+
+  useEffect(() => {
+    if (!installPath) {
+      setAvailableSpace('...')
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const result = await window.electronAPI.getFreeDiskSpace({ path: installPath })
+        if (cancelled) return
+        setAvailableSpace(result.success ? formatBytes(result.bytes) : '—')
+      } catch {
+        if (!cancelled) setAvailableSpace('—')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [installPath])
 
   // Cycle install messages
   useEffect(() => {
@@ -150,54 +356,75 @@ export function LaunchGate({
 
   // Poll download progress during installation
   useEffect(() => {
-    if (currentStep !== 'installing') return
+    if (currentStep !== 'installing' || !downloadSessionId) return
 
     const pollProgress = async () => {
-      try {
-        const response = await backendFetch('/api/models/download/progress')
-        if (response.ok) {
-          const progress = await response.json()
-          setDownloadProgress(progress)
+      const result = await ApiClient.getModelDownloadProgress({ sessionId: downloadSessionId })
+      if (!result.ok) {
+        logger.error(`Progress poll error: ${result.error.message}`)
+        return
+      }
 
-          if (progress.status === 'error') {
-            setDownloadError(progress.error || 'Download failed.')
-          } else if (progress.status === 'complete') {
-            setTimeout(() => setCurrentStep('complete'), 600)
-          }
+      const progress = result.data
+      setDownloadProgress(progress)
+
+      if (progress.status === 'error') {
+        downloadQueueRef.current = []
+        setDownloadError(progress.error || 'Download failed.')
+      } else if (progress.status === 'complete') {
+        const nextStep = downloadQueueRef.current.shift() ?? null
+        if (nextStep) {
+          await startDownloadStep(nextStep)
+          return
         }
-      } catch (e) {
-        logger.error(`Progress poll error: ${e}`)
+        setTimeout(() => setCurrentStep('complete'), 600)
       }
     }
 
     pollProgress()
     const interval = setInterval(pollProgress, 500)
     return () => clearInterval(interval)
-  }, [currentStep])
+  }, [currentStep, downloadSessionId, startDownloadStep])
 
   // Start installation
   const startInstallation = async () => {
     setCurrentStep('installing')
     try {
-      // If API key is provided, save it to settings first and skip text encoder download
       if (ltxApiKey.trim()) {
         try {
-          await backendFetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ltxApiKey: ltxApiKey.trim() }),
-          })
+          await saveLtxApiKey(ltxApiKey.trim())
         } catch (e) {
-          logger.error(`Failed to save API key: ${e}`)
+          logger.error(`Failed to save API key: ${e instanceof Error ? e.message : String(e)}`)
         }
       }
 
-      // Start download - skip text encoder if API key is provided
-      await backendFetch('/api/models/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skipTextEncoder: !!ltxApiKey.trim() }),
-      })
+      const [ltxResult, imgGenResult] = await Promise.all([
+        ApiClient.getLtxRecommendation(),
+        ApiClient.getImgGenRecommendation(),
+      ])
+      if (!ltxResult.ok) {
+        throw new Error(ltxResult.error.message)
+      }
+      if (!imgGenResult.ok) {
+        throw new Error(imgGenResult.error.message)
+      }
+      const nextLtxRecommendation = ltxResult.data
+      const nextImgGenRecommendation = imgGenResult.data
+
+      // Saving the key above drops the encoder from the recommendation, so an explicit opt-in
+      // has to be added back here rather than read off the fresh response.
+      const downloadSteps = buildDownloadSteps(
+        nextLtxRecommendation,
+        nextImgGenRecommendation,
+        optedInCpIds,
+      )
+      if (downloadSteps.length === 0) {
+        setCurrentStep('complete')
+        return
+      }
+
+      downloadQueueRef.current = downloadSteps.slice(1)
+      await startDownloadStep(downloadSteps[0])
     } catch (e) {
       logger.error(`Download start error: ${e}`)
       setDownloadError(e instanceof Error ? e.message : 'Failed to start model download.')
@@ -206,6 +433,7 @@ export function LaunchGate({
 
   const retryInstallation = () => {
     setDownloadError(null)
+    downloadQueueRef.current = []
     startInstallation()
   }
 
@@ -263,6 +491,9 @@ export function LaunchGate({
   // Check if next button should be disabled
   const isNextDisabled = () => {
     if (currentStep === 'license') return !licenseAccepted || isActionPending
+    if (currentStep === 'location') {
+      return installCpIds.length > 0 && (!allAuthorized || checkingAccess)
+    }
     if (currentStep === 'complete') return isActionPending
     return false
   }
@@ -445,7 +676,7 @@ export function LaunchGate({
 
           {/* Step 2: Choose Location */}
           {currentStep === 'location' && (
-            <div style={{ animation: 'fadeIn 0.25s ease' }}>
+            <div style={{ animation: 'fadeIn 0.25s ease', overflowY: 'auto', flex: 1, minHeight: 0 }}>
               <h2 style={{
                 fontFamily: "'Miriam Libre', serif",
                 fontSize: 24,
@@ -481,9 +712,9 @@ export function LaunchGate({
                   />
                   <button
                     onClick={async () => {
-                      const dir = await window.electronAPI?.showOpenDirectoryDialog({ title: 'Select Model Installation Folder' })
-                      if (dir) {
-                        setInstallPath(dir)
+                      const result = await window.electronAPI?.openModelsDirChangeDialog()
+                      if (result?.success) {
+                        setInstallPath(result.path)
                       }
                     }}
                     style={{
@@ -513,6 +744,48 @@ export function LaunchGate({
                 </div>
               </div>
 
+              {/* What will be downloaded */}
+              {(requiredItems.length > 0 || allOptionalItems.length > 0) && (
+                <div style={{
+                  marginTop: 24,
+                  background: '#2e3445',
+                  borderRadius: 12,
+                  padding: '14px 18px'
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
+                    <label style={{ fontSize: 13, fontWeight: 600, color: '#ffffff' }}>What will be downloaded</label>
+                    <span style={{ fontSize: 12, color: '#a0a0a0' }}>
+                      Total: <strong style={{ color: '#fff' }}>{formatBytes(totalDownloadBytes)}</strong>
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {requiredItems.map((item) => (
+                      <DownloadItem key={item.cp_id} item={item} />
+                    ))}
+                  </div>
+
+                  {allOptionalItems.length > 0 && (
+                    <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #3a4157' }}>
+                      <label style={{ fontSize: 12, fontWeight: 600, color: '#ffffff' }}>Optional</label>
+                      <p style={{ fontSize: 11, color: '#888', margin: '4px 0 4px' }}>
+                        {allOptionalItems.every((item) => item.role === 'text_encoder')
+                          ? "Your LTX API key covers this, so it isn't needed to generate. Download it to encode prompts on this computer instead — slower, but works offline and without a key."
+                          : "Not required for the current setup. Tick any you want to keep on this computer."}
+                      </p>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        {allOptionalItems.map((item) => (
+                          <DownloadItem
+                            key={item.cp_id}
+                            item={item}
+                            optIn={{ checked: isOptedIn(item), onToggle: () => toggleOptIn(item) }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* LTX API Key - Optional but saves ~25 GB download */}
               <div style={{
                 marginTop: 24,
@@ -529,7 +802,7 @@ export function LaunchGate({
                       marginLeft: 8,
                       fontWeight: 400
                     }}>
-                      Optional - Saves ~25 GB download
+                      Optional — makes the text encoder optional
                     </span>
                   </label>
                 </div>
@@ -537,7 +810,7 @@ export function LaunchGate({
                   type="password"
                   value={ltxApiKey}
                   onChange={(e) => setLtxApiKey(e.target.value)}
-                  placeholder="Enter API key to skip text encoder download..."
+                  placeholder="Enter API key to make the text encoder optional..."
                   style={{
                     width: '100%',
                     background: '#1a1a1a',
@@ -550,16 +823,86 @@ export function LaunchGate({
                   }}
                 />
                 <p style={{ fontSize: 11, color: '#888', marginTop: 8 }}>
-                  {ltxApiKey ? (
+                  {ltxApiKey || hasSavedLtxApiKey ? (
                     <span style={{ color: '#6D28D9' }}>
-                      ✓ Text encoder download will be skipped (using API instead)
+                      ✓ Text encoder download is optional (using API instead). Tick it under Optional if you want it offline.
                     </span>
                   ) : (
-                    'If you have an LTX API key, entering it here skips the 25 GB text encoder download. ' +
-                    'The API provides faster text encoding (~1s vs 23s local).'
+                    'If you have an LTX API key, entering it here makes the text encoder optional. ' +
+                    'The API encodes prompts faster than running the local encoder.'
                   )}
                 </p>
               </div>
+
+              {/* HuggingFace Authentication */}
+              <div style={{
+                marginTop: 24,
+                background: '#2e3445',
+                borderRadius: 12,
+                padding: '14px 18px'
+              }}>
+                <div style={{ marginBottom: 8 }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: '#ffffff' }}>
+                    HuggingFace Account
+                    <span style={{
+                      fontSize: 11,
+                      color: hfAuthStatus === 'authenticated' ? '#22c55e' : (allAuthorized ? '#888' : '#f59e0b'),
+                      marginLeft: 8,
+                      fontWeight: 400
+                    }}>
+                      {hfAuthStatus === 'authenticated'
+                        ? 'Signed in'
+                        : allAuthorized
+                          ? 'Optional'
+                          : 'Required'}
+                    </span>
+                  </label>
+                </div>
+                {allAuthorized ? (
+                  hfAuthStatus === 'authenticated' ? (
+                    <p style={{ fontSize: 12, color: '#22c55e' }}>
+                      ✓ Authenticated — gated models will download with your account.
+                    </p>
+                  ) : (
+                    <>
+                      <p style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
+                        Optional for this install. Sign in if you later download gated models from Settings.
+                      </p>
+                      <button
+                        onClick={startHuggingFaceLogin}
+                        disabled={hfAuthPolling}
+                        style={{
+                          padding: '10px 28px',
+                          borderRadius: 9999,
+                          fontSize: 13,
+                          fontWeight: 600,
+                          cursor: hfAuthPolling ? 'default' : 'pointer',
+                          background: hfAuthPolling ? '#333' : '#4f46e5',
+                          border: 'none',
+                          color: '#ffffff',
+                          transition: 'all 0.2s ease',
+                          opacity: hfAuthPolling ? 0.7 : 1
+                        }}
+                      >
+                        {hfAuthPolling ? 'Waiting for sign in...' : 'Sign in with HuggingFace'}
+                      </button>
+                    </>
+                  )
+                ) : (
+                  <HfModelAccessGate
+                    accessMap={accessMap}
+                    allAuthorized={allAuthorized}
+                    hfAuthStatus={hfAuthStatus}
+                    hfAuthPolling={hfAuthPolling}
+                    startHuggingFaceLogin={() => {
+                      void startHuggingFaceLogin()
+                    }}
+                    checkError={checkError}
+                    onRetryCheck={recheckAccess}
+                  />
+                )}
+              </div>
+
             </div>
           )}
 
@@ -681,10 +1024,10 @@ export function LaunchGate({
                   marginBottom: 8
                 }}>
                   <span style={{ fontSize: 13, fontWeight: 500 }}>
-                    {(downloadProgress?.totalProgress || 0) > 85 ? 'Installing...' : 'Downloading...'}
+                    {totalProgress > 85 ? 'Installing...' : 'Downloading...'}
                   </span>
                   <span style={{ fontSize: 13, color: '#A98BD9', fontWeight: 600 }}>
-                    {downloadProgress?.totalProgress || 0}%
+                    {Math.round(totalProgress)}%
                   </span>
                 </div>
 
@@ -701,7 +1044,7 @@ export function LaunchGate({
                     backgroundSize: '200% 200%',
                     animation: 'gradientShift 3s ease infinite',
                     borderRadius: 3,
-                    width: `${downloadProgress?.totalProgress || 0}%`,
+                    width: `${totalProgress}%`,
                     transition: 'width 0.3s ease'
                   }} />
                 </div>
@@ -717,22 +1060,22 @@ export function LaunchGate({
                 }}>
                   {/* Current file */}
                   <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {downloadProgress?.currentFile || installMessage}
+                    {runningDownloadProgress?.current_downloading_file || installMessage}
                   </span>
 
                   {/* Speed and ETA */}
                   <div style={{ display: 'flex', gap: 16, marginLeft: 16, flexShrink: 0 }}>
-                    {downloadProgress && downloadProgress.speedMbps > 0 && (
+                    {runningDownloadProgress && runningDownloadProgress.speed_bytes_per_sec > 0 && (
                       <span style={{ color: '#6D28D9', fontWeight: 500 }}>
-                        {downloadProgress.speedMbps.toFixed(1)} MB/s
+                        {(runningDownloadProgress.speed_bytes_per_sec / (1024 * 1024)).toFixed(1)} MB/s
                       </span>
                     )}
-                    {downloadProgress && downloadProgress.totalBytes > 0 && (
+                    {runningDownloadProgress && runningDownloadProgress.expected_total_bytes > 0 && (
                       <span>
-                        {formatBytes(downloadProgress.downloadedBytes)} / {formatBytes(downloadProgress.totalBytes)}
+                        {formatBytes(runningDownloadProgress.total_downloaded_bytes)} / {formatBytes(runningDownloadProgress.expected_total_bytes)}
                       </span>
                     )}
-                    {downloadProgress && downloadProgress.speedMbps > 0 && (
+                    {runningDownloadProgress && runningDownloadProgress.speed_bytes_per_sec > 0 && (
                       <span>
                         ETA: {getTimeRemaining()}
                       </span>
@@ -741,13 +1084,13 @@ export function LaunchGate({
                 </div>
 
                 {/* Files progress */}
-                {downloadProgress && downloadProgress.totalFiles > 0 && (
+                {runningDownloadProgress && runningDownloadProgress.all_files.length > 0 && (
                   <div style={{
                     marginTop: 6,
                     fontSize: 11,
                     color: '#666'
                   }}>
-                    File {downloadProgress.filesCompleted + 1} of {downloadProgress.totalFiles}
+                    File {runningDownloadProgress.completed_files.length + 1} of {runningDownloadProgress.all_files.length}
                   </div>
                 )}
               </>

@@ -1,4 +1,4 @@
-import { ipcMain, dialog } from 'electron'
+import { dialog } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import { getAllowedRoots } from '../config'
@@ -6,6 +6,9 @@ import { logger } from '../logger'
 import { getMainWindow } from '../window'
 import { validatePath, approvePath } from '../path-validation'
 import { getProjectAssetsPath, setProjectAssetsPath } from '../app-state'
+import { extractVideoFrameToFile, getVideoDimensions } from '../export/ffmpeg-utils'
+import { createDownsampledThumbnail, getImageDimensions, getThumbnailPaths } from './image-utils'
+import { handle } from './typed-handle'
 
 const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
@@ -33,12 +36,12 @@ function readLocalFileAsBase64(filePath: string): { data: string; mimeType: stri
   return { data: base64, mimeType }
 }
 
-function searchDirectoryForFiles(dir: string, filenames: string[]): Record<string, string> {
+function searchDirectoryForFilesImpl(dir: string, filenames: string[]): Record<string, string> {
   const results: Record<string, string> = {}
   const remaining = new Set(filenames.map(f => f.toLowerCase()))
 
   const walk = (currentDir: string, depth: number) => {
-    if (remaining.size === 0 || depth > 10) return // max depth to avoid infinite loops
+    if (remaining.size === 0 || depth > 10) return
     try {
       const entries = fs.readdirSync(currentDir, { withFileTypes: true })
       for (const entry of entries) {
@@ -63,21 +66,148 @@ function searchDirectoryForFiles(dir: string, filenames: string[]): Record<strin
   return results
 }
 
+function resolveLocalSourcePath(srcPath: string): string {
+  if (!srcPath || !srcPath.trim()) {
+    throw new Error('Source path is empty')
+  }
+
+  const normalized = srcPath.trim()
+
+  if (!path.isAbsolute(normalized)) {
+    throw new Error(`Source path must be absolute: ${srcPath}`)
+  }
+
+  const resolved = path.resolve(normalized)
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Source file does not exist: ${resolved}`)
+  }
+  if (!fs.statSync(resolved).isFile()) {
+    throw new Error(`Source path is not a file: ${resolved}`)
+  }
+  return resolved
+}
+
+function getUniqueDestinationPath(destDir: string, fileName: string): string {
+  const parsed = path.parse(fileName)
+  let candidate = path.join(destDir, fileName)
+  let idx = 1
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(destDir, `${parsed.name}(${idx})${parsed.ext}`)
+    idx += 1
+  }
+  return candidate
+}
+
+function copyToProjectAssetDirectory(srcPath: string, projectId: string): string {
+  const assetsRoot = getProjectAssetsPath()
+  const destDir = path.join(assetsRoot, projectId)
+  fs.mkdirSync(destDir, { recursive: true })
+  const fileName = path.basename(srcPath)
+  const destPath = getUniqueDestinationPath(destDir, fileName)
+  fs.copyFileSync(srcPath, destPath)
+  return destPath
+}
+
+function createVideoBigThumbnail(videoPath: string, bigThumbnailPath: string): void {
+  extractVideoFrameToFile({
+    videoPath,
+    seekTime: 0,
+    outputPath: bigThumbnailPath,
+    timeoutMs: 30000,
+  })
+}
+
+function createVisualThumbnails(assetPath: string, type: 'video' | 'image'): { bigThumbnailPath: string; smallThumbnailPath: string } {
+  const { bigThumbnailPath: generatedBigThumbnailPath, smallThumbnailPath } = getThumbnailPaths(assetPath)
+  let bigThumbnailPath: string
+
+  switch (type) {
+    case 'video':
+      bigThumbnailPath = generatedBigThumbnailPath
+      createVideoBigThumbnail(assetPath, bigThumbnailPath)
+      break
+    case 'image':
+      bigThumbnailPath = assetPath
+      break
+    default: {
+      const unsupportedType: never = type
+      throw new Error(`Unsupported visual asset type: ${unsupportedType}`)
+    }
+  }
+
+  createDownsampledThumbnail(bigThumbnailPath, smallThumbnailPath)
+  return { bigThumbnailPath, smallThumbnailPath }
+}
+
+function getVisualAssetDimensions(assetPath: string, type: 'video' | 'image'): { width: number; height: number } {
+  switch (type) {
+    case 'video':
+      return getVideoDimensions(assetPath)
+    case 'image':
+      return getImageDimensions(assetPath)
+    default: {
+      const unsupportedType: never = type
+      throw new Error(`Unsupported visual asset type: ${unsupportedType}`)
+    }
+  }
+}
 
 export function registerFileHandlers(): void {
-  ipcMain.handle('open-ltx-api-key-page', async () => {
+  handle('openLtxApiKeyPage', async () => {
     const { shell } = await import('electron')
     await shell.openExternal('https://console.ltx.video/api-keys/')
     return true
   })
 
-  ipcMain.handle('open-fal-api-key-page', async () => {
+  handle('openLtxBillingPage', async () => {
+    const { shell } = await import('electron')
+    await shell.openExternal('https://console.ltx.video/billings/#buy')
+    return true
+  })
+
+  handle('openFalApiKeyPage', async () => {
     const { shell } = await import('electron')
     await shell.openExternal('https://fal.ai/dashboard/keys')
     return true
   })
 
-  ipcMain.handle('open-parent-folder-of-file', async (_event, filePath: string) => {
+  handle('openHuggingFaceRepo', async ({ repoId }) => {
+    const { shell } = await import('electron')
+    await shell.openExternal(`https://huggingface.co/${repoId}`)
+    return true
+  })
+
+  handle('openExternalUrl', async ({ url }) => {
+    const { shell } = await import('electron')
+    // Only https — never let the renderer open file://, custom-scheme, or other handlers.
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      throw new Error('Only https URLs may be opened')
+    }
+    if (parsed.protocol !== 'https:') throw new Error('Only https URLs may be opened')
+    await shell.openExternal(url)
+    return true
+  })
+
+  const HF_AUTHORIZE_URL = 'https://huggingface.co/oauth/authorize'
+
+  handle('openHuggingFaceAuth', async (params) => {
+    const { shell } = await import('electron')
+    const url = new URL(HF_AUTHORIZE_URL)
+    url.searchParams.set('client_id', params.clientId)
+    url.searchParams.set('redirect_uri', params.redirectUri)
+    url.searchParams.set('response_type', 'code')
+    url.searchParams.set('scope', params.scope)
+    url.searchParams.set('state', params.state)
+    url.searchParams.set('code_challenge', params.codeChallenge)
+    url.searchParams.set('code_challenge_method', params.codeChallengeMethod)
+    await shell.openExternal(url.toString())
+    return true
+  })
+
+  handle('openParentFolderOfFile', async ({ filePath }) => {
     const { shell } = await import('electron')
     const normalizedPath = validatePath(filePath, getAllowedRoots())
     const parentDir = path.dirname(normalizedPath)
@@ -87,12 +217,12 @@ export function registerFileHandlers(): void {
     shell.openPath(parentDir)
   })
 
-  ipcMain.handle('show-item-in-folder', async (_event, filePath: string) => {
+  handle('showItemInFolder', async ({ filePath }) => {
     const { shell } = await import('electron')
     shell.showItemInFolder(filePath)
   })
 
-  ipcMain.handle('read-local-file', async (_event, filePath: string) => {
+  handle('readLocalFile', async ({ filePath }) => {
     try {
       const normalizedPath = validatePath(filePath, getAllowedRoots())
 
@@ -107,34 +237,20 @@ export function registerFileHandlers(): void {
     }
   })
 
-  ipcMain.handle('approve-local-path', async (_event, filePath: string) => {
-    try {
-      approvePath(filePath)
-      return true
-    } catch (error) {
-      logger.error(`Error approving local path: ${error}`)
-      return false
-    }
-  })
-
-  ipcMain.handle('show-save-dialog', async (_event, options: {
-    title?: string
-    defaultPath?: string
-    filters?: { name: string; extensions: string[] }[]
-  }) => {
+  handle('showSaveDialog', async ({ title, defaultPath, filters }) => {
     const mainWindow = getMainWindow()
     if (!mainWindow) return null
     const result = await dialog.showSaveDialog(mainWindow, {
-      title: options.title || 'Save File',
-      defaultPath: options.defaultPath,
-      filters: options.filters || [],
+      title: title || 'Save File',
+      defaultPath,
+      filters: filters || [],
     })
     if (result.canceled || !result.filePath) return null
     approvePath(result.filePath)
     return result.filePath
   })
 
-  ipcMain.handle('save-file', async (_event, filePath: string, data: string, encoding?: string) => {
+  handle('saveFile', async ({ filePath, data, encoding }) => {
     try {
       validatePath(filePath, getAllowedRoots())
       if (encoding === 'base64') {
@@ -149,7 +265,7 @@ export function registerFileHandlers(): void {
     }
   })
 
-  ipcMain.handle('save-binary-file', async (_event, filePath: string, data: ArrayBuffer) => {
+  handle('saveBinaryFile', async ({ filePath, data }) => {
     try {
       validatePath(filePath, getAllowedRoots())
       fs.writeFileSync(filePath, Buffer.from(data))
@@ -160,11 +276,11 @@ export function registerFileHandlers(): void {
     }
   })
 
-  ipcMain.handle('show-open-directory-dialog', async (_event, options: { title?: string }) => {
+  handle('showOpenDirectoryDialog', async ({ title }) => {
     const mainWindow = getMainWindow()
     if (!mainWindow) return null
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: options.title || 'Select Folder',
+      title: title || 'Select Folder',
       properties: ['openDirectory', 'createDirectory'],
     })
     if (result.canceled || result.filePaths.length === 0) return null
@@ -172,42 +288,97 @@ export function registerFileHandlers(): void {
     return result.filePaths[0]
   })
 
-  ipcMain.handle('search-directory-for-files', async (_event, dir: string, filenames: string[]) => {
-    return searchDirectoryForFiles(dir, filenames)
+  handle('searchDirectoryForFiles', ({ directory, filenames }) => {
+    return searchDirectoryForFilesImpl(directory, filenames)
   })
 
-  ipcMain.handle('copy-to-project-assets', async (_event, srcPath: string, projectId: string) => {
+  handle('addVisualAssetToProject', ({ srcPath, projectId, type }) => {
     try {
-      const resolvedSrc = validatePath(srcPath, getAllowedRoots())
-      const assetsRoot = getProjectAssetsPath()
-      const destDir = path.join(assetsRoot, projectId)
-      fs.mkdirSync(destDir, { recursive: true })
-      const fileName = path.basename(resolvedSrc)
-      const destPath = path.join(destDir, fileName)
-      fs.copyFileSync(resolvedSrc, destPath)
-      const normalized = destPath.replace(/\\/g, '/')
-      const fileUrl = normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`
-      return { success: true, path: destPath, url: fileUrl }
+      const resolvedSrc = resolveLocalSourcePath(srcPath)
+      const destPath = copyToProjectAssetDirectory(resolvedSrc, projectId)
+      const { bigThumbnailPath, smallThumbnailPath } = createVisualThumbnails(destPath, type)
+      const { width, height } = getVisualAssetDimensions(destPath, type)
+
+      return {
+        success: true,
+        path: destPath,
+        bigThumbnailPath,
+        smallThumbnailPath,
+        width,
+        height,
+      }
     } catch (error) {
-      logger.error(`Error copying to project assets: ${error}`)
+      logger.error(`Error adding asset to project: ${error}`)
       return { success: false, error: String(error) }
     }
   })
 
-  ipcMain.handle('get-project-assets-path', async () => {
+  handle('addGenericAssetToProject', ({ srcPath, projectId }) => {
+    try {
+      const resolvedSrc = resolveLocalSourcePath(srcPath)
+      const destPath = copyToProjectAssetDirectory(resolvedSrc, projectId)
+      return { success: true, path: destPath }
+    } catch (error) {
+      logger.error(`Error copying file to project assets: ${error}`)
+      return { success: false, error: String(error) }
+    }
+  })
+
+  handle('makeThumbnailsForProjectAsset', ({ path: assetPath, type }) => {
+    try {
+      const resolvedAssetPath = resolveLocalSourcePath(assetPath)
+      const { bigThumbnailPath, smallThumbnailPath } = createVisualThumbnails(resolvedAssetPath, type)
+
+      return {
+        success: true,
+        bigThumbnailPath,
+        smallThumbnailPath,
+      }
+    } catch (error) {
+      logger.error(`Error creating thumbnails for project asset: ${error}`)
+      return { success: false, error: String(error) }
+    }
+  })
+
+  handle('makeDimensionsForProjectAsset', ({ path: assetPath, type }) => {
+    try {
+      const resolvedAssetPath = resolveLocalSourcePath(assetPath)
+      const { width, height } = getVisualAssetDimensions(resolvedAssetPath, type)
+
+      return {
+        success: true,
+        width,
+        height,
+      }
+    } catch (error) {
+      logger.error(`Error creating dimensions for project asset: ${error}`)
+      return { success: false, error: String(error) }
+    }
+  })
+
+  handle('getProjectAssetsPath', () => {
     return getProjectAssetsPath()
   })
 
-  ipcMain.handle('set-project-assets-path', async (_event, newPath: string) => {
+  handle('openProjectAssetsPathChangeDialog', async () => {
     try {
-      setProjectAssetsPath(newPath)
-      return { success: true }
+      const mainWindow = getMainWindow()
+      if (!mainWindow) return { success: false, error: 'No window' }
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Select Project Assets Path',
+        properties: ['openDirectory', 'createDirectory'],
+      })
+      if (result.canceled || result.filePaths.length === 0) return { success: false, error: 'cancelled' }
+      const selectedPath = path.resolve(result.filePaths[0])
+      setProjectAssetsPath(selectedPath)
+      approvePath(selectedPath)
+      return { success: true, path: selectedPath }
     } catch (error) {
       return { success: false, error: String(error) }
     }
   })
 
-  ipcMain.handle('check-files-exist', async (_event, filePaths: string[]) => {
+  handle('checkFilesExist', ({ filePaths }) => {
     const results: Record<string, boolean> = {}
     for (const p of filePaths) {
       try {
@@ -219,18 +390,14 @@ export function registerFileHandlers(): void {
     return results
   })
 
-  ipcMain.handle('show-open-file-dialog', async (_event, options: {
-    title?: string
-    filters?: { name: string; extensions: string[] }[]
-    properties?: string[]
-  }) => {
+  handle('showOpenFileDialog', async ({ title, filters, properties }) => {
     const mainWindow = getMainWindow()
     if (!mainWindow) return null
     const props: any[] = ['openFile']
-    if (options.properties?.includes('multiSelections')) props.push('multiSelections')
+    if (properties?.includes('multiSelections')) props.push('multiSelections')
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: options.title || 'Select File',
-      filters: options.filters || [],
+      title: title || 'Select File',
+      filters: filters || [],
       properties: props,
     })
     if (result.canceled || result.filePaths.length === 0) return null

@@ -3,9 +3,11 @@ import {
   X, Upload, Video, Image,
   Loader2, Sparkles, RefreshCw, Info
 } from 'lucide-react'
+import { pathToFileUrl } from '../../lib/file-url'
 import { SettingsPanel } from '../../components/SettingsPanel'
 import type { GenerationSettings } from '../../components/SettingsPanel'
-import type { GenerationMode } from '../../components/ModeTabs'
+import type { GenerationMode } from '../../components/SettingsPanel'
+import type { VideoGenerationModelSpecItem } from '../../lib/video-generation-model-specs'
 
 interface TimelineGap {
   trackIndex: number
@@ -29,6 +31,9 @@ interface GapGenerationModalProps {
   gapAfterFrame: string | null
   gapSettings: GenerationSettings
   setGapSettings: (settings: GenerationSettings) => void
+  gapVideoModelSpecs: VideoGenerationModelSpecItem[]
+  gapVideoSettingsMessage?: string | null
+  gapCanGenerateVideo: boolean
   gapImageFile: File | null
   setGapImageFile: (file: File | null) => void
   gapImageInputRef: React.RefObject<HTMLInputElement>
@@ -37,7 +42,7 @@ interface GapGenerationModalProps {
   regenProgress: number
   regenReset: () => void
   handleGapGenerate: () => void
-  deleteGap: (gap: TimelineGap) => void
+  handleCloseGap: () => void
   setSelectedGap: (gap: TimelineGap | null) => void
   gapApplyAudioToTrack: boolean
   setGapApplyAudioToTrack: (v: boolean) => void
@@ -58,6 +63,9 @@ export function GapGenerationModal({
   gapAfterFrame,
   gapSettings,
   setGapSettings,
+  gapVideoModelSpecs,
+  gapVideoSettingsMessage,
+  gapCanGenerateVideo,
   gapImageFile,
   setGapImageFile,
   gapImageInputRef,
@@ -66,7 +74,7 @@ export function GapGenerationModal({
   regenProgress,
   regenReset,
   handleGapGenerate,
-  deleteGap,
+  handleCloseGap,
   setSelectedGap,
   gapApplyAudioToTrack,
   setGapApplyAudioToTrack,
@@ -221,7 +229,7 @@ export function GapGenerationModal({
                     onClick={() => { if (startFrameEnabled) { setStartFrameEnabled(false) } else { setStartFrameEnabled(true); setEndFrameEnabled(false) } }}
                   >
                     <img
-                      src={displayedBeforeFrame}
+                      src={pathToFileUrl(displayedBeforeFrame)}
                       alt=""
                       className={`w-full h-full object-cover transition-all duration-300 ${
                         !startFrameEnabled ? 'grayscale opacity-50' : ''
@@ -287,7 +295,7 @@ export function GapGenerationModal({
                     onClick={() => { if (endFrameEnabled) { setEndFrameEnabled(false) } else { setEndFrameEnabled(true); setStartFrameEnabled(false) } }}
                   >
                     <img
-                      src={displayedAfterFrame}
+                      src={pathToFileUrl(displayedAfterFrame)}
                       alt=""
                       className={`w-full h-full object-cover transition-all duration-300 ${
                         !endFrameEnabled ? 'grayscale opacity-50' : ''
@@ -404,6 +412,10 @@ export function GapGenerationModal({
                   onSettingsChange={setGapSettings}
                   disabled={isRegenerating}
                   mode={settingsMode}
+                  videoModelSpecs={gapVideoModelSpecs}
+                  minimumDuration={selectedGap.endTime - selectedGap.startTime}
+                  hideDuration={isVideoMode}
+                  videoSettingsMessage={gapVideoSettingsMessage}
                 />
               </div>
 
@@ -469,7 +481,7 @@ export function GapGenerationModal({
               </button>
               <button
                 onClick={handleGapGenerate}
-                disabled={isRegenerating || !gapPrompt.trim()}
+                disabled={isRegenerating || !gapPrompt.trim() || (isVideoMode && !gapCanGenerateVideo)}
                 className="px-4 py-1.5 rounded-md bg-blue-600 text-white text-sm hover:bg-blue-500 transition-colors font-medium disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
               >
                 {isRegenerating ? (
@@ -536,7 +548,7 @@ export function GapGenerationModal({
           </button>
           <div className="h-px bg-zinc-800 mx-0 my-1" />
           <button
-            onClick={() => deleteGap(selectedGap)}
+            onClick={handleCloseGap}
             className="w-full px-3 py-1.5 text-left text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300 transition-colors flex items-center justify-between"
           >
             <span>Close gap</span>

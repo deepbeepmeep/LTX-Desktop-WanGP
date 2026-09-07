@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import cast
 
+from services.depth_processor_pipeline.depth_processor_pipeline import DepthProcessorPipeline
+from services.pose_processor_pipeline.pose_processor_pipeline import PoseProcessorPipeline
 from services.video_processor.video_processor import VideoInfoPayload
 from services.services_utils import FrameArray, VideoCaptureLike, VideoWriterLike
 
@@ -39,20 +41,43 @@ class VideoProcessorImpl:
             return None
         return cast(FrameArray, frame)
 
+    def read_image(self, path: str) -> FrameArray:
+        import cv2
+
+        img = cv2.imread(path)
+        if img is None:
+            raise ValueError(f"Could not read image: {path}")
+        return cast(FrameArray, img)
+
     def apply_canny(self, frame: FrameArray) -> FrameArray:
         import cv2
+        import numpy as np
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 100, 200)
-        return cast(FrameArray, cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR))
+        img = frame.copy()
 
-    def apply_depth(self, frame: FrameArray) -> FrameArray:
-        import cv2
+        # Pad for compatibility with training flow.
+        H, W = img.shape[:2]
+        H_pad = int(np.ceil(H / 64.0) * 64) - H
+        W_pad = int(np.ceil(W / 64.0) * 64) - W
+        if H_pad > 0 or W_pad > 0:
+            img = np.pad(img, [[0, H_pad], [0, W_pad], [0, 0]], mode="edge")
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-        return cast(FrameArray, cv2.applyColorMap(blurred, cv2.COLORMAP_INFERNO))
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+
+        # Remove padding
+        edges = edges[:H, :W]
+
+        # HWC3: convert single-channel to 3-channel
+        edges_3ch = np.concatenate([edges[:, :, None]] * 3, axis=2)
+
+        return cast(FrameArray, edges_3ch)
+
+    def apply_depth(self, frame: FrameArray, depth_pipeline: DepthProcessorPipeline) -> FrameArray:
+        return depth_pipeline.apply(frame)
+
+    def apply_pose(self, frame: FrameArray, pose_pipeline: PoseProcessorPipeline) -> FrameArray:
+        return pose_pipeline.apply(frame)
 
     def encode_frame_jpeg(self, frame: FrameArray, quality: int = 85) -> bytes:
         import cv2
@@ -66,7 +91,12 @@ class VideoProcessorImpl:
         import cv2
 
         code = cv2.VideoWriter.fourcc(*fourcc)
-        return cast(VideoWriterLike, cv2.VideoWriter(path, code, fps, size))
+        writer = cv2.VideoWriter(path, code, fps, size)
+        # cv2.VideoWriter doesn't raise on a bad codec/dims/unwritable path — it returns a
+        # no-op writer that silently produces a 0-byte file. Fail loudly here instead.
+        if not writer.isOpened():
+            raise ValueError(f"Could not open video writer for {path} (codec={fourcc}, size={size})")
+        return cast(VideoWriterLike, writer)
 
     def release(self, cap_or_writer: VideoCaptureLike | VideoWriterLike) -> None:
         try:

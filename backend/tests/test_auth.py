@@ -7,14 +7,14 @@ import base64
 from starlette.testclient import TestClient
 
 from app_factory import create_app
+from tests.http_error_assertions import assert_http_error
 
 
 def test_request_without_token_returns_401(test_state):
     app = create_app(handler=test_state, auth_token="test-secret")
     with TestClient(app) as client:
         response = client.get("/health")
-        assert response.status_code == 401
-        assert response.json() == {"error": "Unauthorized"}
+        assert_http_error(response, status_code=401, code="HTTP_401", message="Unauthorized")
 
 
 def test_request_with_correct_bearer_token(test_state):
@@ -36,7 +36,7 @@ def test_request_with_wrong_token_returns_401(test_state):
     app = create_app(handler=test_state, auth_token="test-secret")
     with TestClient(app) as client:
         response = client.get("/health", headers={"Authorization": "Bearer wrong-token"})
-        assert response.status_code == 401
+        assert_http_error(response, status_code=401, code="HTTP_401", message="Unauthorized")
 
 
 def test_health_without_token_returns_401(test_state):
@@ -44,7 +44,7 @@ def test_health_without_token_returns_401(test_state):
     app = create_app(handler=test_state, auth_token="test-secret")
     with TestClient(app) as client:
         response = client.get("/health")
-        assert response.status_code == 401
+        assert_http_error(response, status_code=401, code="HTTP_401", message="Unauthorized")
 
 
 def test_no_auth_token_disables_middleware(test_state):
@@ -63,7 +63,7 @@ def test_websocket_with_token_query_param(test_state):
             "/ws/download/test",
             headers={"upgrade": "websocket", "connection": "upgrade"},
         )
-        assert response.status_code == 401
+        assert_http_error(response, status_code=401, code="HTTP_401", message="Unauthorized")
 
         # WebSocket upgrade with correct token query param
         response = client.get(

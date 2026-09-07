@@ -142,7 +142,12 @@ If `WANGP_ROOT` is not set, `pnpm setup:dev:linux` will prepare a repo-local `Wa
 - Text-to-video generation
 - Image-to-video generation
 - Audio-to-video generation
-- Video edit generation (Retake)
+- Video edit generation (Retake) — local **LTX 2.3 Fast**, or Pro on the API
+- Text-to-image generation
+- Image editing (image-to-image)
+- Local **LTX 2.5 Fast** generation (default); switch to **LTX 2.3 Fast** in Settings
+- LoRA support for local video generation
+- Catalog-aware prompt enhancement (video, image generation, and image editing) — local or via the Gemini API
 - Video Editor Interface
 - Video Editing Projects
 
@@ -156,7 +161,17 @@ If `WANGP_ROOT` is not set, `pnpm setup:dev:linux` will prepare a repo-local `Wa
 | Linux + CUDA GPU + WanGP checkout | Local generation | Source/dev setup supported in this fork |
 | Linux without WanGP bridge | API-only | **LTX API key required** |
 
-In API-only mode, available resolutions/durations may be limited to what the API supports.
+In API-only mode, available resolutions/durations may be limited to what the API supports. The API path also offers **LTX 2.5 Fast**, **LTX 2.5 Pro**, and 2.3 Fast/Pro.
+
+### Local models
+
+| Model | Where | Notes |
+| --- | --- | --- |
+| **LTX 2.5 Fast** | Local (default) and API | t2v / i2v / a2v, IC-LoRA, user LoRAs. No local Retake or Extend. |
+| **LTX 2.3 Fast** | Local and API | Full local feature set, including Retake and Extend. |
+| **LTX 2.5 Pro** / **2.3 Pro** | API only | Paid cloud generation. |
+
+Switch the active local checkpoint in **Settings > Models**. Newer weights (including 2.5) are gated on Hugging Face — sign in and accept the license before downloading.
 
 ## System requirements
 
@@ -165,13 +180,28 @@ In API-only mode, available resolutions/durations may be limited to what the API
 - Windows 10/11 (x64)
 - NVIDIA GPU with CUDA support and as low as 6 GB VRAM with WanGP
 - 16 GB+ RAM (32 GB recommended)
+
+### Linux (local generation)
+
+- Ubuntu 22.04+ or similar distro (x64 or arm64)
+- NVIDIA GPU with CUDA support and **≥16GB VRAM** (more is better)
+- NVIDIA driver installed (PyTorch bundles the CUDA runtime)
+- 16GB+ RAM (32GB recommended)
+>>>>>>> upstream/main
 - Plenty of free disk space for model weights and outputs
 
-### macOS (API-only)
+### macOS (local generation)
 
-- Apple Silicon (arm64)
+- Apple Silicon (arm64) — Intel Macs have no MPS backend and stay in API-only mode
 - macOS 13+ (Ventura)
-- Stable internet connection
+- **≥15GB free RAM** (not total — the OS/Electron/app already use some); more avoids weight streaming from disk
+- Plenty of free disk space for model weights and outputs
+
+Below the free-RAM floor, or on an Intel Mac, the app falls back to API-only mode instead — same as underpowered Windows/Linux hardware (see the table above). API-only mode just needs a stable internet connection.
+
+**How the RAM check works.** The app checks *free* RAM — not total — and only **once**, at launch (when the Python backend process starts). It is not re-checked while the app is running. If other apps are using memory at that moment, you can land in API-only mode even on a capable Mac.
+
+If you have 32GB+ of total RAM but still see API-only mode: close memory-heavy apps (browsers are usually the biggest offender), then **quit and relaunch LTX Desktop** — freeing memory while the app is already open has no effect, since the check doesn't run again until the next launch.
 
 ### Linux (source/dev with WanGP)
 
@@ -203,6 +233,45 @@ Text encoding: to generate videos you must configure text encoding:
 - **LTX API key** (cloud text encoding) - **text encoding via the API is completely free** and highly recommended to speed up inference and save memory. Generate a free API key at the [LTX Console](https://console.ltx.video/). [Read more](https://ltx.io/model/model-blog/ltx-2-better-control-for-real-workflows).
 - **Local Text Encoder** (extra download; enables fully local operation on supported Windows and Linux WanGP setups) - if you do not wish to generate an API key, you can encode text locally via the settings menu.
 
+## LoRA/IC-LoRA Library
+
+LoRA adapters let you steer **local** video generation toward a specific style or subject. They apply to local generation (Windows/Linux NVIDIA hardware or Apple Silicon Macs), for text-to-video, image-to-video, and audio-to-video — not in API/cloud mode.
+
+In local mode, **Browse LoRAs** (styles/subjects for text/image/audio-to-video) and **Browse IC-LoRAs** (in-context effects, e.g. video-to-video) open a built-in library of ready-to-download LoRAs — no manual file placement needed. Each entry shows a preview, its instructions, and a link to its Hugging Face page; some gated models require signing in with Hugging Face first. Entries authored by **LTX** are official; everything else is community-contributed and flagged with a disclaimer that LTX doesn't endorse or take responsibility for it.
+
+### Custom LoRAs
+
+You can also use your own `.safetensors` LoRA files instead of (or alongside) the library.
+
+**Which LoRAs are supported.** Local generation uses **LTX‑2.5 Fast** or **LTX‑2.3 Fast** (both 22B distilled). Catalog entries list the models they support (typically both). LoRAs labeled **LTX‑2**, **LTX‑2.3**, or **LTX‑2.5** target this family and are supported. This includes LoRAs exported from ComfyUI for LTX‑Video (their key names are remapped automatically). A LoRA whose tensors don't match the active model is simply skipped, so it has no effect rather than producing an error. LoRAs built for other base models (e.g. SDXL, Wan, Hunyuan, or older LTXV 0.9.x) target a different architecture and will not take effect.
+
+**Where to put the files.** Library downloads land in their own subfolder under `loras/` (one per LoRA), so it's safe to drop your own `.safetensors` files straight into the `loras/` (or `lora/`) subfolder of your models folder:
+
+```
+models/
+└── loras/
+    ├── cinematic.safetensors
+    ├── claymation.safetensors
+    └── <lora-id>/              ← library download, one subfolder per LoRA
+        └── model.safetensors
+```
+
+> **Use the `loras/` subfolder.** A file is detected as a LoRA only if it lives in a folder named `loras`/`lora` **or** its filename contains `lora` — and many LoRAs aren't named that way. Dropping them straight into `loras/` is the reliable option; it won't collide with library downloads, which each get their own subfolder. Subfolders are scanned recursively, so further nesting is fine.
+
+Your models folder is the location you chose during setup, or the default for your platform:
+
+- **Windows:** `%LOCALAPPDATA%\LTXDesktop\models\`
+- **macOS:** `~/Library/Application Support/LTXDesktop/models/`
+- **Linux:** `$XDG_DATA_HOME/LTXDesktop/models/` (default: `~/.local/share/LTXDesktop/models/`)
+
+**When the LoRA button appears.** In the generation view, a **LoRA** selector appears next to the other video settings (FPS, aspect ratio) only when **all** of these are true:
+
+1. You're in **Video** generation mode (not Image, Retake, or IC‑LoRA).
+2. You're generating **locally** — not in API/cloud generation mode.
+3. **At least one** LoRA file is detected in the models folder.
+
+Open the selector to tick one or more LoRAs and adjust each one's strength. If you added files while the app was already open, reopen the generation view (or restart the app) — the installed‑LoRA list is read on load.
+
 ## API keys, cost, and privacy
 
 ### LTX API key
@@ -221,13 +290,13 @@ When you use API-backed features, prompts and media inputs are sent to the API s
 
 ### fal API key (optional)
 
-Used for Z Image Turbo text-to-image generation in API mode. When enabled, image generation requests are sent to fal.ai.
+Used for Z Image Turbo text-to-image generation and image editing (image-to-image) in API mode. When enabled, image generation/editing requests are sent to fal.ai. You can also opt into API-based image generation from **Settings > General > Images Generation** even on hardware that supports local generation.
 
 Create an API key in the [fal dashboard](https://fal.ai/dashboard/keys).
 
 ### Gemini API key (optional)
 
-Used for AI prompt suggestions. When enabled, prompt context and frames may be sent to Google Gemini.
+Used for AI prompt suggestions (timeline gap fill) and, as an alternative to the local text encoder, for the **Enhance** prompt button's "API" mode — the same catalog-aware prompt rewriting, without needing the Local Text Encoder downloaded. When enabled, prompt context and frames/reference images may be sent to Google Gemini.
 
 ## Architecture
 
@@ -260,7 +329,7 @@ Prereqs:
 
 - Node.js
 - `uv` (Python package manager)
-- Python 3.12+
+- Python 3.13+
 - Git
 
 Setup:
@@ -303,6 +372,17 @@ Backend tests:
 ```bash
 pnpm backend:test
 ```
+
+Performance & validation:
+
+```bash
+pnpm perf:dev
+```
+
+Starts the backend headless and opens the performance runner dashboard — soak/leak
+tests, cold-start latency, VRAM-fit-per-GPU, output-integrity, and a full
+feature-surface sanity sweep, all against the same backend the app ships. See
+[`backend/performance_runner/README.md`](backend/performance_runner/README.md).
 
 Building installers:
 - See [`INSTALLER.md`](docs/INSTALLER.md)

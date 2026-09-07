@@ -27,9 +27,6 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: TypeScript type check
-        run: pnpm run typecheck:ts
-
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           version: "latest"
@@ -48,6 +45,15 @@ jobs:
         working-directory: backend
         run: uv run pyright
 
+      - name: OpenAPI contract check
+        run: pnpm run openapi:check
+
+      - name: TypeScript type check
+        run: pnpm run typecheck:ts
+
+      - name: Pack helper tests
+        run: pnpm run scripts:test
+
   test-python:
     name: Python Tests (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -59,6 +65,8 @@ jobs:
             runner: macos-latest
           - os: windows
             runner: windows-latest
+          - os: linux
+            runner: ubuntu-latest
     defaults:
       run:
         working-directory: backend

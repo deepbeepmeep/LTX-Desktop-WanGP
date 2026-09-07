@@ -17,6 +17,7 @@ App data folder locations:
 
 - **Windows:** `%LOCALAPPDATA%\LTXDesktop\`
 - **macOS:** `~/Library/Application Support/LTXDesktop/`
+- **Linux:** `$XDG_DATA_HOME/LTXDesktop/` (default: `~/.local/share/LTXDesktop/`)
 
 Your preference is respected immediately — no restart required.
 

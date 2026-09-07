@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Sparkles, X, Search } from 'lucide-react'
-import { EFFECT_DEFINITIONS, type EffectType, type TimelineClip } from '../../types/project'
+import { EFFECT_DEFINITIONS } from '../../types/project'
+import type { EffectType, TimelineClip } from '../../types/project-model'
 
 interface EffectsBrowserProps {
   onClose: () => void

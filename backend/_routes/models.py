@@ -1,41 +1,99 @@
-"""Route handlers for /api/models, /api/models/status, /api/models/download/*."""
+"""Route handlers for checkpoint recommendation and download APIs."""
 
 from __future__ import annotations
 
-import logging
+from fastapi import APIRouter, Depends, Query
 
-from fastapi import APIRouter, Depends
-
+from _routes._errors import HTTPError
 from api_types import (
+    ActiveDownloadResponse,
+    CheckModelAccessRequest,
+    CheckModelAccessResponse,
+    DescribeCheckpointsRequest,
+    DescribeCheckpointsResponse,
     DownloadProgressResponse,
+    ImageGenRecommendationResponse,
+    InstalledModelsResponse,
+    LtxIcLoraRecommendationResponse,
+    LtxModelVersionsResponse,
+    LtxRecommendationResponse,
+    ModelDeleteRequest,
     ModelDownloadRequest,
     ModelDownloadStartResponse,
-    ModelInfo,
-    ModelsStatusResponse,
-    TextEncoderDownloadResponse,
+    SetActiveLtxModelRequest,
+    StatusResponse,
+    TextEncoderRecommendationResponse,
 )
-from _routes._errors import HTTPError
-from state import get_state_service
 from app_handler import AppHandler
-
-logger = logging.getLogger(__name__)
+from state import get_state_service
 
 router = APIRouter(prefix="/api", tags=["models"])
 
 
-@router.get("/models", response_model=list[ModelInfo])
-def route_models_list(handler: AppHandler = Depends(get_state_service)) -> list[ModelInfo]:
-    return handler.models.get_models_list()
+@router.get("/models", response_model=InstalledModelsResponse)
+def route_list_models(
+    model_type: str | None = Query(default=None, alias="type"),
+    handler: AppHandler = Depends(get_state_service),
+) -> InstalledModelsResponse:
+    """Return installed model files. ?type=lora -> regular LoRAs only;
+    ?type=ic-lora -> IC-LoRAs only; no type -> all installed models."""
+    return handler.models.list_installed_models(model_type=model_type)
 
 
-@router.get("/models/status", response_model=ModelsStatusResponse)
-def route_models_status(handler: AppHandler = Depends(get_state_service)) -> ModelsStatusResponse:
-    return handler.models.get_models_status()
+@router.get("/models/ltx-recommendation", response_model=LtxRecommendationResponse)
+def route_ltx_recommendation(handler: AppHandler = Depends(get_state_service)) -> LtxRecommendationResponse:
+    return handler.models.get_ltx_recommendation()
+
+
+@router.get("/models/img-gen-recommendation", response_model=ImageGenRecommendationResponse)
+def route_img_gen_recommendation(handler: AppHandler = Depends(get_state_service)) -> ImageGenRecommendationResponse:
+    return handler.models.get_img_gen_recommendation()
+
+
+@router.get("/models/ltx-ic-lora-recommendation", response_model=LtxIcLoraRecommendationResponse)
+def route_ltx_ic_lora_recommendation(
+    handler: AppHandler = Depends(get_state_service),
+) -> LtxIcLoraRecommendationResponse:
+    return handler.models.get_ltx_ic_lora_recommendation()
+
+
+@router.get("/models/text-encoder-recommendation", response_model=TextEncoderRecommendationResponse)
+def route_text_encoder_recommendation(
+    handler: AppHandler = Depends(get_state_service),
+) -> TextEncoderRecommendationResponse:
+    return handler.models.get_text_encoder_recommendation()
+
+
+@router.post("/models/describe", response_model=DescribeCheckpointsResponse)
+def route_describe_checkpoints(
+    req: DescribeCheckpointsRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> DescribeCheckpointsResponse:
+    return handler.models.describe_checkpoints(req.cp_ids)
+
+
+@router.get("/models/download/active", response_model=ActiveDownloadResponse)
+def route_active_download(handler: AppHandler = Depends(get_state_service)) -> ActiveDownloadResponse:
+    return handler.downloads.get_active_download()
 
 
 @router.get("/models/download/progress", response_model=DownloadProgressResponse)
-def route_download_progress(handler: AppHandler = Depends(get_state_service)) -> DownloadProgressResponse:
-    return handler.downloads.get_download_progress()
+def route_download_progress(
+    sessionId: str = Query(...),
+    handler: AppHandler = Depends(get_state_service),
+) -> DownloadProgressResponse:
+    try:
+        return handler.downloads.get_download_progress(sessionId)
+    except ValueError as exc:
+        raise HTTPError(404, "UNKNOWN_DOWNLOAD_SESSION") from exc
+
+
+@router.post("/models/check-access", response_model=CheckModelAccessResponse)
+def route_check_model_access(
+    req: CheckModelAccessRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> CheckModelAccessResponse:
+    return handler.downloads.check_model_access(req.cp_ids)
 
 
 @router.post("/models/download", response_model=ModelDownloadStartResponse)
@@ -43,34 +101,37 @@ def route_model_download(
     req: ModelDownloadRequest,
     handler: AppHandler = Depends(get_state_service),
 ) -> ModelDownloadStartResponse:
+    session_id = handler.downloads.start_model_download(
+        download_type=req.type,
+        cp_ids=req.cp_ids,
+    )
+    return ModelDownloadStartResponse(
+        status="started",
+        message="Model download started",
+        sessionId=session_id,
+    )
+
+
+@router.get("/models/ltx-versions", response_model=LtxModelVersionsResponse)
+def route_ltx_versions(handler: AppHandler = Depends(get_state_service)) -> LtxModelVersionsResponse:
+    return handler.models.list_ltx_versions()
+
+
+@router.post("/models/active-ltx-model", response_model=StatusResponse)
+def route_set_active_ltx_model(
+    req: SetActiveLtxModelRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> StatusResponse:
+    handler.models.set_active_ltx_model(req.model_id)
+    return StatusResponse(status="ok")
+
+
+@router.delete("/models/delete", response_model=StatusResponse)
+def route_model_delete(
+    req: ModelDeleteRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> StatusResponse:
     if handler.downloads.is_download_running():
-        raise HTTPError(409, "Download already in progress")
-
-    settings = handler.settings.get_settings_snapshot()
-    skip_text_encoder = req.skipTextEncoder
-    if settings.ltx_api_key and not settings.use_local_text_encoder:
-        skip_text_encoder = True
-
-    if handler.downloads.start_model_download(skip_text_encoder=skip_text_encoder):
-        return ModelDownloadStartResponse(
-            status="started",
-            message="Model download started",
-            skippingTextEncoder=skip_text_encoder,
-        )
-
-    raise HTTPError(400, "Failed to start download")
-
-
-@router.post("/text-encoder/download", response_model=TextEncoderDownloadResponse)
-def route_text_encoder_download(handler: AppHandler = Depends(get_state_service)) -> TextEncoderDownloadResponse:
-    if handler.downloads.is_download_running():
-        raise HTTPError(409, "Download already in progress")
-
-    files = handler.models.refresh_available_files()
-    if files["text_encoder"] is not None:
-        return TextEncoderDownloadResponse(status="already_downloaded", message="Text encoder already downloaded")
-
-    if handler.downloads.start_text_encoder_download():
-        return TextEncoderDownloadResponse(status="started", message="Text encoder download started")
-
-    raise HTTPError(400, "Failed to start download")
+        raise HTTPError(409, "DOWNLOAD_ALREADY_RUNNING")
+    handler.models.delete_checkpoints(req.cp_ids)
+    return StatusResponse(status="ok")

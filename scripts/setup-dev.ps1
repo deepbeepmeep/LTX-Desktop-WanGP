@@ -1,3 +1,5 @@
+﻿# Windows development setup for LTX Desktop
+
 $ErrorActionPreference = "Stop"
 
 function Ok($msg) { Write-Host "[OK] $msg" -ForegroundColor Green }

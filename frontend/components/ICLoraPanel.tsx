@@ -1,465 +1,612 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import {
-  X, Play, Pause, Upload, Loader2, Film, Sparkles,
-  FolderOpen, ChevronDown, RefreshCw, Settings, Download, Check, AlertCircle,
+  Upload, Loader2, Film, Sparkles, Image as ImageIcon,
+  RefreshCw, Download, AlertCircle, Trash2,
 } from 'lucide-react'
-import { backendFetch } from '../lib/backend'
+import { ApiClient, type ApiRequestBodyOf, type ApiSuccessOf } from '../lib/api-client'
 import { logger } from '../lib/logger'
+import { pathToFileUrl } from '../lib/file-url'
+import { OutpaintCanvasEditor, type OutpaintPads } from './OutpaintCanvasEditor'
 
-interface ICLoraModel {
-  name: string
-  path: string
-  conditioning_type: string
-  reference_downscale_factor: number
-}
+export type ICLoraConditioningType = 'canny' | 'depth' | 'custom'
 
 interface ICLoraPanelProps {
-  isOpen: boolean
-  onClose: () => void
-  initialVideoUrl?: string
-  initialVideoPath?: string
-  initialClipName?: string
-  sourceClipId?: string | null
-  onResult: (result: { videoPath: string; sourceClipId: string | null }) => void
+  initialVideoPath?: string | null
+  resetKey?: number
+  fillHeight?: boolean
+  isProcessing?: boolean
+  processingStatus?: string
+  // IC-LoRA mode: 'image' accepts a still image and skips canny/depth preprocessing
+  // (the IC-LoRA builds the control video server-side). Default 'video' = today's behavior.
+  inputKind?: 'image' | 'video'
+  // IC-LoRA mode: when an IC-LoRA is selected (via the library modal) the panel switches to
+  // IC-LoRA mode and hides the canny/depth conditioning preview. The catalog/download UI
+  // lives in the modal, not here.
+  selectedIcLoraId?: string | null
+  // Catalog IC-LoRA opt-in: when true the middle column offers an optional reference-image
+  // picker (instead of the canny/depth conditioning preview, which catalog IC-LoRAs hide).
+  allowsReferenceImage?: boolean
+  // Outpainting (position_canvas control): when true the middle column shows the canvas editor.
+  showOutpaintCanvas?: boolean
+  outpaintPads?: OutpaintPads
+  onOutpaintPadsChange?: (pads: OutpaintPads) => void
+  // Library browsing (and catalog IC-LoRA generation in general) is local-only.
+  isLocalMode?: boolean
+  onBrowseLibrary?: () => void
+  conditioningType?: ICLoraConditioningType
+  onConditioningTypeChange?: (type: ICLoraConditioningType) => void
+  conditioningStrength?: number
+  onConditioningStrengthChange?: (strength: number) => void
+  outputVideoPath?: string | null
+  onChange?: (data: {
+    videoPath: string | null
+    conditioningType: ICLoraConditioningType
+    conditioningStrength: number
+    ready: boolean
+    referenceImagePath: string | null
+    // Source pixel dimensions (0 until media loads) — feeds the resolution control.
+    width: number
+    height: number
+  }) => void
 }
 
-type ConditioningType = 'canny' | 'depth'
-
-const CONDITIONING_TYPES: { value: ConditioningType; label: string; desc: string }[] = [
+export const CONDITIONING_TYPES: { value: ICLoraConditioningType; label: string; desc: string }[] = [
   { value: 'canny', label: 'Canny Edges', desc: 'Edge detection' },
   { value: 'depth', label: 'Depth Map', desc: 'Estimated depth' },
+  { value: 'custom', label: 'Custom IC-LoRA', desc: 'Your own weights + control video' },
 ]
 
-const OFFICIAL_IC_LORA_MODELS = [
-  {
-    id: 'canny',
-    label: 'Canny Control',
-    repo_id: 'Lightricks/LTX-2-19b-IC-LoRA-Canny-Control',
-    filename: 'ltx-2-19b-ic-lora-canny-control.safetensors',
-  },
-  {
-    id: 'depth',
-    label: 'Depth Control',
-    repo_id: 'Lightricks/LTX-2-19b-IC-LoRA-Depth-Control',
-    filename: 'ltx-2-19b-ic-lora-depth-control.safetensors',
-  },
-  {
-    id: 'pose',
-    label: 'Pose Control',
-    repo_id: 'Lightricks/LTX-2-19b-IC-LoRA-Pose-Control',
-    filename: 'ltx-2-19b-ic-lora-pose-control.safetensors',
-  },
-  {
-    id: 'detailer',
-    label: 'Video Detailer',
-    repo_id: 'Lightricks/LTX-2-19b-IC-LoRA-Detailer',
-    filename: 'ltx-2-19b-ic-lora-detailer.safetensors',
-  },
-]
+type StartModelDownloadBody = NonNullable<ApiRequestBodyOf<'startModelDownload'>>
+type ModelCheckpointID = NonNullable<StartModelDownloadBody['cp_ids']>[number]
+type DownloadProgress = ApiSuccessOf<'getModelDownloadProgress'>
+
 
 export function ICLoraPanel({
-  isOpen,
-  onClose,
-  initialVideoUrl,
   initialVideoPath,
-  sourceClipId,
-  onResult,
+  resetKey,
+  fillHeight = false,
+  isProcessing = false,
+  processingStatus = '',
+  inputKind = 'video',
+  selectedIcLoraId = null,
+  allowsReferenceImage = false,
+  showOutpaintCanvas = false,
+  outpaintPads,
+  onOutpaintPadsChange,
+  isLocalMode = false,
+  onBrowseLibrary,
+  conditioningType: conditioningTypeProp,
+  onConditioningTypeChange,
+  conditioningStrength: conditioningStrengthProp,
+  onConditioningStrengthChange,
+  outputVideoPath: _outputVideoPath,
+  onChange,
 }: ICLoraPanelProps) {
-  // Close on Escape
-  useEffect(() => {
-    if (!isOpen) return
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { onClose(); e.stopPropagation() }
-    }
-    document.addEventListener('keydown', handleKey)
-    return () => document.removeEventListener('keydown', handleKey)
-  }, [isOpen, onClose])
-
-  // Video state
   const inputVideoRef = useRef<HTMLVideoElement>(null)
-  const outputVideoRef = useRef<HTMLVideoElement>(null)
-  const [inputVideoUrl, setInputVideoUrl] = useState(initialVideoUrl || '')
-  const [inputVideoPath, setInputVideoPath] = useState(initialVideoPath || '')
-  const [inputPlaying, setInputPlaying] = useState(false)
+  const [inputVideoPath, setInputVideoPath] = useState<string | null>(initialVideoPath || null)
+  const inputVideoUrl = inputVideoPath ? pathToFileUrl(inputVideoPath) : null
   const [inputTime, setInputTime] = useState(0)
-  const [inputDuration, setInputDuration] = useState(0)
+  // Source pixel dimensions, read off the loaded media — drives the outpaint canvas editor.
+  const [sourceDims, setSourceDims] = useState<{ w: number; h: number } | null>(null)
 
-  // Conditioning preview
-  const [conditioningType, setConditioningType] = useState<ConditioningType>('canny')
+  // Optional reference image for catalog IC-LoRAs that allow it (frame 0, strength 1.0).
+  const [referenceImagePath, setReferenceImagePath] = useState<string | null>(null)
+  const referenceImageUrl = referenceImagePath ? pathToFileUrl(referenceImagePath) : null
+  const [isReferenceDragOver, setIsReferenceDragOver] = useState(false)
+
+  const [internalCondType, setInternalCondType] = useState<ICLoraConditioningType>('canny')
+  const [internalCondStrength, setInternalCondStrength] = useState(1.0)
+  const conditioningType = conditioningTypeProp ?? internalCondType
+  const conditioningStrength = conditioningStrengthProp ?? internalCondStrength
+  // Custom mode: the user supplies their own IC-LoRA + a pre-rendered control video,
+  // so there's no canny/depth preprocessing to preview.
+  const isCustom = conditioningType === 'custom'
+  // Image (IC-LoRA) mode: no canny/depth preprocessing, no bundled-cp download gate.
+  const isImage = inputKind === 'image'
+  // Catalog IC-LoRA mode (any input kind): the IC-LoRA builds its own control video server-side.
+  const isCatalogIcLora = selectedIcLoraId !== null
+  // The conditioning preview only applies to the built-in canny/depth flow.
+  const showConditioningPreview = !isCatalogIcLora && !isCustom
   const [conditioningPreview, setConditioningPreview] = useState<string | null>(null)
   const [isExtracting, setIsExtracting] = useState(false)
 
-  // LoRA models
-  const [models, setModels] = useState<ICLoraModel[]>([])
-  const [selectedModel, setSelectedModel] = useState<ICLoraModel | null>(null)
-  const [showModelDropdown, setShowModelDropdown] = useState(false)
-  // Download state
-  const [downloadingModels, setDownloadingModels] = useState<Record<string, 'downloading' | 'done' | 'error'>>({})
+  const [requiredIcLoraCpIds, setRequiredIcLoraCpIds] = useState<ModelCheckpointID[]>([])
+  const [icLoraSupported, setIcLoraSupported] = useState(true)
+  const [isCheckingIcLora, setIsCheckingIcLora] = useState(false)
+  const [isDownloadingIcLora, setIsDownloadingIcLora] = useState(false)
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null)
+  const [downloadError, setDownloadError] = useState<string | null>(null)
+  const [downloadSessionId, setDownloadSessionId] = useState<string | null>(null)
+  const [extractError, setExtractError] = useState<string | null>(null)
+  const [isDragOver, setIsDragOver] = useState(false)
+  const icLoraReady = icLoraSupported && requiredIcLoraCpIds.length === 0
 
-  // Reference image(s)
-  const [refImages, setRefImages] = useState<{ path: string; url: string; frame: number; strength: number }[]>([])
-
-  // Generation params
-  const [prompt, setPrompt] = useState('')
-  const [conditioningStrength, setConditioningStrength] = useState(1.0)
-  const [seed, setSeed] = useState(42)
-  // Note: IC-LoRA pipeline Stage 1 runs at this res, Stage 2 upsamples 2x
-  // So 512x352 → output 1024x704, 608x352 → output 1216x704
-  const [width, setWidth] = useState(608)
-  const [height, setHeight] = useState(352)
-  const [numFrames, setNumFrames] = useState(121)
-  const [frameRate, setFrameRate] = useState(24)
-
-  // Generation state
-  const [isGenerating, setIsGenerating] = useState(false)
-  const [generationStatus, setGenerationStatus] = useState('')
-  const [generationError, setGenerationError] = useState<string | null>(null)
-  const [outputVideoUrl, setOutputVideoUrl] = useState<string | null>(null)
-  const [outputVideoPath, setOutputVideoPath] = useState<string | null>(null)
-  const [showSettings, setShowSettings] = useState(false)
-
-  // Reset when opened
+  // Switching to an entry with a different input.kind (image vs video) invalidates the loaded
+  // input — clear it so a stale video can't be submitted to an image-input entry (backend 400).
+  const prevInputKindRef = useRef(inputKind)
   useEffect(() => {
-    if (isOpen) {
-      setInputVideoUrl(initialVideoUrl || '')
-      setInputVideoPath(initialVideoPath || '')
-      setConditioningPreview(null)
-      setOutputVideoUrl(null)
-      setOutputVideoPath(null)
-      setIsGenerating(false)
-      setGenerationStatus('')
-      setPrompt('')
-      setRefImages([])
-      fetchModels()
-    }
-  }, [isOpen, initialVideoUrl, initialVideoPath])
+    if (prevInputKindRef.current === inputKind) return
+    prevInputKindRef.current = inputKind
+    setInputVideoPath(null)
+    setInputTime(0)
+    setSourceDims(null)
+    setConditioningPreview(null)
+    setExtractError(null)
+  }, [inputKind])
 
-  // Fetch available models
-  const fetchModels = useCallback(async () => {
-    try {
-      const resp = await backendFetch('/api/ic-lora/list-models')
-      if (resp.ok) {
-        const data = await resp.json()
-        setModels(data.models || [])
-        if (data.models?.length > 0 && !selectedModel) {
-          setSelectedModel(data.models[0])
-        }
+  useEffect(() => {
+    if (resetKey === undefined) return
+    setInputVideoPath(initialVideoPath || null)
+    setInputTime(0)
+    setSourceDims(null)
+    setInternalCondType('canny')
+    setInternalCondStrength(1.0)
+    onConditioningTypeChange?.('canny')
+    onConditioningStrengthChange?.(1.0)
+    setConditioningPreview(null)
+    setExtractError(null)
+    setReferenceImagePath(null)
+  }, [resetKey, initialVideoPath]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    // Custom brings its own IC-LoRA + control video; recipes (any input kind) build the
+    // control video server-side. Neither needs the bundled canny/depth cps.
+    const ready = !!inputVideoPath && (isCustom || isImage || isCatalogIcLora || icLoraReady)
+    onChange?.({
+      videoPath: inputVideoPath,
+      conditioningType,
+      conditioningStrength,
+      ready,
+      referenceImagePath,
+      width: sourceDims?.w ?? 0,
+      height: sourceDims?.h ?? 0,
+    })
+  }, [inputVideoUrl, inputVideoPath, conditioningType, conditioningStrength, isCustom, isImage, isCatalogIcLora, icLoraReady, referenceImagePath, sourceDims, onChange])
+
+  const checkIcLoraAvailability = useCallback(async () => {
+    setIsCheckingIcLora(true)
+    const result = await ApiClient.getLtxIcLoraRecommendation()
+    if (!result.ok) {
+      logger.warn(`Failed to fetch IC-LoRA model status: ${result.error.message}`)
+      setDownloadError(result.error.message)
+      setIsCheckingIcLora(false)
+      return
+    }
+
+    const recommendationPayload = result.data
+    setRequiredIcLoraCpIds(recommendationPayload.cps_to_download)
+    setIcLoraSupported(recommendationPayload.supported)
+    const isReady = recommendationPayload.supported && recommendationPayload.cps_to_download.length === 0
+
+    if (isReady) {
+      setIsDownloadingIcLora(false)
+      setDownloadProgress(null)
+      setDownloadError(null)
+      setDownloadSessionId(null)
+    }
+    setIsCheckingIcLora(false)
+  }, [])
+
+  useEffect(() => {
+    void checkIcLoraAvailability()
+  }, [checkIcLoraAvailability])
+
+  useEffect(() => {
+    if (icLoraReady || !isDownloadingIcLora || !downloadSessionId) return
+
+    const pollProgress = async () => {
+      const result = await ApiClient.getModelDownloadProgress({ sessionId: downloadSessionId })
+      if (!result.ok) {
+        logger.warn(`Failed polling IC-LoRA download progress: ${result.error.message}`)
+        return
       }
-    } catch (e) {
-      logger.warn(`Failed to fetch IC-LoRA models: ${e}`)
-    }
-  }, [selectedModel])
 
-  // Extract conditioning preview when time or type changes
+      const progressPayload = result.data
+      setDownloadProgress(progressPayload)
+
+      if (progressPayload.status === 'error') {
+        setIsDownloadingIcLora(false)
+        setDownloadError(progressPayload.error || 'Model download failed')
+        return
+      }
+
+      if (progressPayload.status === 'complete') {
+        setIsDownloadingIcLora(false)
+        await checkIcLoraAvailability()
+      }
+    }
+
+    void pollProgress()
+    const interval = setInterval(() => { void pollProgress() }, 1000)
+    return () => clearInterval(interval)
+  }, [icLoraReady, isDownloadingIcLora, downloadSessionId, checkIcLoraAvailability])
+
+  const handleDownloadIcLora = useCallback(async () => {
+    if (isDownloadingIcLora) return
+    setDownloadError(null)
+
+    const result = await ApiClient.startModelDownload({
+      type: 'download',
+      cp_ids: [...requiredIcLoraCpIds],
+    })
+    if (!result.ok) {
+      logger.warn(`Failed to start IC-LoRA download: ${result.error.message}`)
+      setDownloadError(result.error.message)
+      return
+    }
+
+    const startedPayload = result.data
+    if (startedPayload.status === 'started') {
+      setDownloadSessionId(startedPayload.sessionId)
+      setIsDownloadingIcLora(true)
+      return
+    }
+
+    setDownloadError('Unexpected response while starting IC-LoRA download')
+  }, [isDownloadingIcLora, requiredIcLoraCpIds])
+
+  const isExtractingRef = useRef(false)
   const extractConditioning = useCallback(async () => {
-    if (!inputVideoPath || isExtracting) return
+    if (isCustom || isImage || isCatalogIcLora || !inputVideoPath || isExtractingRef.current || !icLoraReady) return
+    isExtractingRef.current = true
     setIsExtracting(true)
-    try {
-      const resp = await backendFetch('/api/ic-lora/extract-conditioning', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_path: inputVideoPath,
-          conditioning_type: conditioningType,
-          frame_time: inputTime,
-        }),
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        setConditioningPreview(data.conditioning)
-      }
-    } catch (e) {
-      logger.warn(`Failed to extract conditioning: ${e}`)
-    } finally {
+    setExtractError(null)
+    const result = await ApiClient.extractIcLoraConditioning({
+      video_path: inputVideoPath,
+      conditioning_type: conditioningType,
+      frame_time: inputTime,
+    })
+    if (!result.ok) {
+      logger.warn(`Failed to extract conditioning: ${result.error.message}`)
+      setExtractError(result.error.message)
+      isExtractingRef.current = false
       setIsExtracting(false)
+      return
     }
-  }, [inputVideoPath, conditioningType, inputTime, isExtracting])
 
-  // Debounced conditioning extraction on time/type change
-  const extractTimerRef = useRef<NodeJS.Timeout | null>(null)
+    setConditioningPreview(result.data.conditioning)
+    isExtractingRef.current = false
+    setIsExtracting(false)
+  }, [inputVideoPath, conditioningType, inputTime, icLoraReady, isCustom, isImage, isCatalogIcLora])
+
+  const extractTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
-    if (!inputVideoPath) return
+    if (isCustom || isImage || isCatalogIcLora || !inputVideoPath || !icLoraReady) return
     if (extractTimerRef.current) clearTimeout(extractTimerRef.current)
     extractTimerRef.current = setTimeout(() => {
-      extractConditioning()
+      void extractConditioning()
     }, 300)
-    return () => { if (extractTimerRef.current) clearTimeout(extractTimerRef.current) }
-  }, [inputTime, conditioningType, inputVideoPath])
+    return () => {
+      if (extractTimerRef.current) clearTimeout(extractTimerRef.current)
+    }
+  }, [inputTime, conditioningType, inputVideoPath, icLoraReady, extractConditioning])
 
-  // Video time tracking
   useEffect(() => {
     const video = inputVideoRef.current
     if (!video) return
     const onTime = () => setInputTime(video.currentTime)
-    const onLoaded = () => setInputDuration(video.duration || 0)
+    const onSeeked = () => setInputTime(video.currentTime)
     video.addEventListener('timeupdate', onTime)
-    video.addEventListener('loadedmetadata', onLoaded)
+    video.addEventListener('seeked', onSeeked)
     return () => {
       video.removeEventListener('timeupdate', onTime)
-      video.removeEventListener('loadedmetadata', onLoaded)
+      video.removeEventListener('seeked', onSeeked)
     }
-  }, [inputVideoUrl])
+  }, [inputVideoUrl, icLoraReady, isCheckingIcLora])
 
-  const toggleInputPlay = useCallback(() => {
-    const v = inputVideoRef.current
-    if (!v) return
-    if (v.paused) { v.play(); setInputPlaying(true) }
-    else { v.pause(); setInputPlaying(false) }
-  }, [])
-
-  // Browse for a video file
-  const handleImportVideo = useCallback(async () => {
-    const paths = await window.electronAPI.showOpenFileDialog({
-      title: 'Select Driving Video',
-      filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'avi', 'webm', 'mkv'] }],
-    })
+  const handleBrowse = useCallback(async () => {
+    const paths = await window.electronAPI.showOpenFileDialog(
+      isImage
+        ? { title: 'Select Input Image', filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] }
+        : { title: 'Select Driving Video', filters: [{ name: 'Video', extensions: ['mp4', 'mov', 'avi', 'webm', 'mkv'] }] },
+    )
     if (paths && paths.length > 0) {
       const filePath = paths[0]
-      const normalized = filePath.replace(/\\/g, '/')
-      const url = normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`
       setInputVideoPath(filePath)
-      setInputVideoUrl(url)
+
       setConditioningPreview(null)
-      setOutputVideoUrl(null)
+      setExtractError(null)
     }
+  }, [isImage])
+
+  const handleClear = useCallback(() => {
+    setInputVideoPath(null)
+
+    setInputTime(0)
+    setSourceDims(null)
+    setConditioningPreview(null)
+    setExtractError(null)
   }, [])
 
-  // Import a reference image
-  const handleImportImage = useCallback(async () => {
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setIsDragOver(false)
+
+    const acceptedAssetType = isImage ? 'image' : 'video'
+    const assetData = e.dataTransfer.getData('asset')
+    if (assetData) {
+      try {
+        const asset = JSON.parse(assetData) as { type?: string; path?: string }
+        if (asset.type === acceptedAssetType && asset.path) {
+          setInputVideoPath(asset.path)
+          setConditioningPreview(null)
+          setExtractError(null)
+          return
+        }
+      } catch {
+        // fall through
+      }
+    }
+
+    const file = e.dataTransfer.files?.[0]
+    if (file) {
+      const filePath = window.electronAPI?.getPathForFile(file)
+      if (filePath) {
+        setInputVideoPath(filePath)
+
+        setConditioningPreview(null)
+        setExtractError(null)
+      }
+    }
+  }, [isImage])
+
+  const handleBrowseReference = useCallback(async () => {
     const paths = await window.electronAPI.showOpenFileDialog({
       title: 'Select Reference Image',
-      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'] }],
+      filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
     })
     if (paths && paths.length > 0) {
-      const filePath = paths[0]
-      const normalized = filePath.replace(/\\/g, '/')
-      const url = normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`
-      setRefImages(prev => [...prev, { path: filePath, url, frame: 0, strength: 1.0 }])
+      setReferenceImagePath(paths[0])
     }
   }, [])
 
-  // Remove a reference image
-  const handleRemoveImage = useCallback((idx: number) => {
-    setRefImages(prev => prev.filter((_, i) => i !== idx))
+  const handleClearReference = useCallback(() => {
+    setReferenceImagePath(null)
   }, [])
 
-  // Update reference image params
-  const handleUpdateImage = useCallback((idx: number, updates: Partial<{ frame: number; strength: number }>) => {
-    setRefImages(prev => prev.map((img, i) => i === idx ? { ...img, ...updates } : img))
-  }, [])
+  const handleDropReference = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setIsReferenceDragOver(false)
 
-  // Download an official IC-LoRA model
-  const handleDownloadModel = useCallback(async (modelDef: typeof OFFICIAL_IC_LORA_MODELS[0]) => {
-    if (downloadingModels[modelDef.id] === 'downloading') return
-    setDownloadingModels(prev => ({ ...prev, [modelDef.id]: 'downloading' }))
-    try {
-      const resp = await backendFetch('/api/ic-lora/download-model', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelDef.id }),
-      })
-      const data = await resp.json()
-      if (resp.ok && (data.status === 'complete')) {
-        setDownloadingModels(prev => ({ ...prev, [modelDef.id]: 'done' }))
-        // Refresh the model list
-        fetchModels()
-      } else {
-        setDownloadingModels(prev => ({ ...prev, [modelDef.id]: 'error' }))
+    const assetData = e.dataTransfer.getData('asset')
+    if (assetData) {
+      try {
+        const asset = JSON.parse(assetData) as { type?: string; path?: string }
+        if (asset.type === 'image' && asset.path) {
+          setReferenceImagePath(asset.path)
+          return
+        }
+      } catch {
+        // fall through
       }
-    } catch {
-      setDownloadingModels(prev => ({ ...prev, [modelDef.id]: 'error' }))
     }
-  }, [downloadingModels])
 
-  // Browse for a custom LoRA file
-  const handleBrowseLora = useCallback(async () => {
-    const paths = await window.electronAPI.showOpenFileDialog({
-      title: 'Select IC-LoRA Model',
-      filters: [{ name: 'SafeTensors', extensions: ['safetensors'] }],
-    })
-    if (paths && paths.length > 0) {
-      const custom: ICLoraModel = {
-        name: paths[0].split(/[/\\]/).pop()?.replace('.safetensors', '') || 'Custom LoRA',
-        path: paths[0],
-        conditioning_type: 'unknown',
-        reference_downscale_factor: 1,
-      }
-      setSelectedModel(custom)
-      setShowModelDropdown(false)
+    const file = e.dataTransfer.files?.[0]
+    if (file) {
+      const filePath = window.electronAPI?.getPathForFile(file)
+      if (filePath) setReferenceImagePath(filePath)
     }
   }, [])
 
-  // Generate
-  const handleGenerate = useCallback(async () => {
-    if (!inputVideoPath || !selectedModel || isGenerating || !prompt.trim()) return
-
-    setIsGenerating(true)
-    setGenerationStatus('Loading IC-LoRA pipeline...')
-    setGenerationError(null)
-    setOutputVideoUrl(null)
-    setOutputVideoPath(null)
-
-    try {
-      setGenerationStatus('Generating video with IC-LoRA...')
-      const resp = await backendFetch('/api/ic-lora/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_path: inputVideoPath,
-          lora_path: selectedModel.path,
-          conditioning_type: conditioningType,
-          prompt,
-          conditioning_strength: conditioningStrength,
-          seed,
-          height,
-          width,
-          num_frames: numFrames,
-          frame_rate: frameRate,
-          images: refImages.map(img => ({ path: img.path, frame: img.frame, strength: img.strength })),
-        }),
-      })
-
-      const data = await resp.json()
-      if (resp.ok && data.status === 'complete' && data.video_path) {
-        const pathNorm = data.video_path.replace(/\\/g, '/')
-        const url = pathNorm.startsWith('/') ? `file://${pathNorm}` : `file:///${pathNorm}`
-        setOutputVideoUrl(url)
-        setOutputVideoPath(data.video_path)
-        setGenerationStatus('Generation complete!')
-      } else {
-        const errorMsg = data.error || 'Unknown error'
-        setGenerationStatus(`Error: ${errorMsg}`)
-        setGenerationError(errorMsg)
-      }
-    } catch (e) {
-      setGenerationStatus(`Error: ${(e as Error).message}`)
-      setGenerationError((e as Error).message)
-    } finally {
-      setIsGenerating(false)
-    }
-  }, [inputVideoPath, selectedModel, prompt, conditioningStrength, seed, height, width, numFrames, frameRate, isGenerating])
-
-  // Accept the output
-  const handleAcceptOutput = useCallback(() => {
-    if (outputVideoPath) {
-      onResult({ videoPath: outputVideoPath, sourceClipId: sourceClipId || null })
-    }
-  }, [outputVideoPath, sourceClipId, onResult])
-
-  if (!isOpen) return null
+  // Only the built-in canny/depth flow needs the bundled preprocessing cps. Recipes
+  // (any input kind) and custom build their own control video, so never gate them.
+  const showBuiltinGate =
+    !isCustom && !isImage && !isCatalogIcLora && (isCheckingIcLora || !icLoraReady)
+  const showUnsupportedGate = showBuiltinGate && !isCheckingIcLora && !icLoraSupported
+  const showDownloadGate = showBuiltinGate && !showUnsupportedGate
+  const runningDownloadProgress =
+    downloadProgress?.status === 'downloading' ? downloadProgress : null
+  const gateItemIds = [...new Set([...(requiredIcLoraCpIds ?? []), ...(runningDownloadProgress?.all_files ?? [])])]
+  const gateItems = gateItemIds.map((cpId) => {
+    const downloaded = !requiredIcLoraCpIds.includes(cpId)
+    const isCompleted = runningDownloadProgress?.completed_files?.includes(cpId) ?? false
+    const isCurrentDownload = isDownloadingIcLora && runningDownloadProgress?.current_downloading_file === cpId
+    const progress = downloaded ? 100 : (isCompleted ? 100 : (isCurrentDownload ? (runningDownloadProgress?.current_file_progress ?? 0) : 0))
+    const status = downloaded ? 'Ready' : (isCompleted ? 'Complete' : (isCurrentDownload ? 'Downloading' : 'Missing'))
+    return { id: cpId, label: cpId, downloaded, progress, status }
+  })
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 backdrop-blur-sm">
-      <div className="bg-zinc-900 rounded-xl border border-zinc-700 shadow-2xl flex flex-col overflow-hidden"
-        style={{ width: '90vw', maxWidth: '1400px', height: '85vh', maxHeight: '900px' }}
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-zinc-800 flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-7 h-7 rounded-lg bg-blue-600/20 flex items-center justify-center">
-              <Sparkles className="h-4 w-4 text-blue-400" />
-            </div>
-            <div>
-              <h2 className="text-sm font-semibold text-white">IC-LoRA / Style Transfer</h2>
-              <p className="text-[10px] text-zinc-500">Video-to-video generation with conditioning LoRAs</p>
-            </div>
-          </div>
+    <div className={`bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden flex flex-col ${fillHeight ? 'h-full min-h-0' : ''}`}>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 flex-shrink-0">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-amber-400" />
+          <span className="text-sm font-semibold text-white">IC-LoRA / Style Transfer</span>
+        </div>
+        {inputVideoUrl && (
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setShowSettings(!showSettings)}
-              className={`p-1.5 rounded hover:bg-zinc-800 transition-colors ${showSettings ? 'text-blue-400' : 'text-zinc-400 hover:text-white'}`}
+              onClick={handleClear}
+              className="p-1.5 rounded-md hover:bg-zinc-800 text-zinc-400 hover:text-white transition-colors"
+              title="Clear video"
             >
-              <Settings className="h-4 w-4" />
+              <Trash2 className="h-3.5 w-3.5" />
             </button>
             <button
-              onClick={onClose}
-              disabled={isGenerating}
-              className="p-1.5 rounded hover:bg-zinc-800 text-zinc-400 hover:text-white transition-colors disabled:opacity-50"
+              onClick={handleBrowse}
+              className="p-1.5 rounded-md hover:bg-zinc-800 text-zinc-400 hover:text-white transition-colors"
+              title="Replace video"
             >
-              <X className="h-4 w-4" />
+              <RefreshCw className="h-3.5 w-3.5" />
             </button>
           </div>
-        </div>
+        )}
+      </div>
 
-        {/* Main content: three columns */}
+      {isLocalMode && (
+        <div className="px-3 py-2 border-b border-zinc-800 flex-shrink-0">
+          <button
+            onClick={onBrowseLibrary}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition-colors"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-amber-400" /> Browse IC-LoRAs
+          </button>
+        </div>
+      )}
+
+      {showUnsupportedGate ? (
+        <div className="flex-1 flex items-center justify-center p-6 min-h-0 overflow-y-auto">
+          <div className="w-full max-w-xl rounded-xl border border-zinc-700 bg-zinc-800/60 p-6">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-amber-600/20 flex items-center justify-center mt-0.5">
+                <AlertCircle className="h-4 w-4 text-amber-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm font-semibold text-white">Built-in control needs LTX 2.3</h3>
+                <p className="text-xs text-zinc-400 mt-1">
+                  Depth and canny Union Control are not available on the active LTX 2.5 model.
+                  Switch to an LTX 2.3 local model in Settings, or use a custom / catalog IC-LoRA.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : showDownloadGate ? (
+        <div className="flex-1 flex items-center justify-center p-6 min-h-0 overflow-y-auto">
+          <div className="w-full max-w-xl rounded-xl border border-zinc-700 bg-zinc-800/60 p-6">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-blue-600/20 flex items-center justify-center mt-0.5">
+                <Download className="h-4 w-4 text-blue-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-sm font-semibold text-white">Download Required: IC-LoRA Resources</h3>
+                <p className="text-xs text-zinc-400 mt-1">
+                  Editing is locked until all IC-LoRA preprocessing models are available locally.
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 space-y-3">
+              {isCheckingIcLora ? (
+                <div className="flex items-center gap-2 text-xs text-zinc-300">
+                  <Loader2 className="h-4 w-4 animate-spin text-blue-400" />
+                  Checking model availability...
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-2">
+                    {gateItems.map(item => (
+                      <div key={item.id} className="rounded-lg border border-zinc-700 bg-zinc-900/60 px-3 py-2">
+                        <div className="flex items-center justify-between text-[11px] mb-1.5">
+                          <span className="text-zinc-300">{item.label}</span>
+                          <span className={item.downloaded ? 'text-blue-400' : 'text-zinc-500'}>
+                            {item.status}
+                          </span>
+                        </div>
+                        <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                          <div
+                            className="h-full transition-all duration-300 bg-blue-500"
+                            style={{ width: `${item.progress}%` }}
+                          />
+                        </div>
+                        <div className="mt-1 text-[10px] text-zinc-500">{item.progress}%</div>
+                      </div>
+                    ))}
+                  </div>
+                  {downloadError && (
+                    <div className="text-[11px] text-red-400">{downloadError}</div>
+                  )}
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      onClick={handleDownloadIcLora}
+                      disabled={isDownloadingIcLora}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isDownloadingIcLora ? (
+                        <>
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          Downloading...
+                        </>
+                      ) : (
+                        <>
+                          <Download className="h-3 w-3" />
+                          {downloadError ? 'Retry Download' : 'Download Models'}
+                        </>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => { void checkIcLoraAvailability() }}
+                      disabled={isCheckingIcLora}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-600 text-zinc-300 hover:text-white hover:border-zinc-500 text-xs transition-colors disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${isCheckingIcLora ? 'animate-spin' : ''}`} />
+                      Refresh
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : (
         <div className="flex-1 flex min-h-0 overflow-hidden">
-          {/* Left: Input Video */}
           <div className="flex-1 flex flex-col border-r border-zinc-800 min-w-0">
-            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between">
-              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Input Video</span>
+            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider shrink-0">Input</span>
+              {inputVideoPath && (
+                <span className="text-[10px] text-zinc-500 truncate min-w-0">
+                  {inputVideoPath.split(/[\\/]/).pop()}
+                </span>
+              )}
               <button
-                onClick={handleImportVideo}
-                className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                onClick={handleBrowse}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors shrink-0"
               >
                 <Upload className="h-3 w-3" />
                 Import
               </button>
             </div>
-            <div className="flex-1 bg-black flex items-center justify-center min-h-0 relative">
+            <div
+              className={`flex-1 min-h-0 bg-black flex items-center justify-center relative ${!inputVideoUrl ? 'border-2 border-dashed border-zinc-700 m-3 rounded-lg' : ''} ${isDragOver ? 'border-blue-500 bg-blue-500/10' : ''}`}
+              onDragOver={(e) => { e.preventDefault(); setIsDragOver(true) }}
+              onDragLeave={() => setIsDragOver(false)}
+              onDrop={handleDrop}
+            >
               {inputVideoUrl ? (
-                <video
-                  ref={inputVideoRef}
-                  src={inputVideoUrl}
-                  className="max-w-full max-h-full object-contain"
-                  onClick={toggleInputPlay}
-                  onEnded={() => setInputPlaying(false)}
-                />
+                isImage ? (
+                  <img
+                    src={inputVideoUrl}
+                    alt="Input"
+                    className="w-full h-full object-contain"
+                    onLoad={(e) => setSourceDims({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+                  />
+                ) : (
+                  <video
+                    ref={inputVideoRef}
+                    src={inputVideoUrl}
+                    className="w-full h-full object-contain"
+                    controls
+                    onLoadedMetadata={(e) => setSourceDims({ w: e.currentTarget.videoWidth, h: e.currentTarget.videoHeight })}
+                  />
+                )
               ) : (
                 <div className="text-center p-4">
                   <div className="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mx-auto mb-2">
                     <Film className="h-6 w-6 text-zinc-600" />
                   </div>
-                  <p className="text-zinc-500 text-xs">No video selected</p>
+                  <p className="text-zinc-400 text-xs">{isImage ? 'Drop or import an image' : isCustom ? 'Drop or import a control video' : 'Drop or import a driving video'}</p>
                   <button
-                    onClick={handleImportVideo}
+                    onClick={handleBrowse}
                     className="mt-2 px-3 py-1.5 text-[10px] text-blue-400 border border-blue-500/30 rounded-lg hover:bg-blue-600/10 transition-colors"
                   >
-                    Import Video
+                    {isImage ? 'Import Image' : 'Import Video'}
                   </button>
                 </div>
               )}
             </div>
-            {inputVideoUrl && (
-              <div className="px-3 py-1.5 border-t border-zinc-800 flex items-center gap-2">
-                <button onClick={toggleInputPlay} className="p-1 rounded hover:bg-zinc-800 text-white">
-                  {inputPlaying ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
-                </button>
-                <div className="flex-1 h-1 bg-zinc-800 rounded-full relative cursor-pointer"
-                  onClick={(e) => {
-                    const rect = e.currentTarget.getBoundingClientRect()
-                    const frac = (e.clientX - rect.left) / rect.width
-                    if (inputVideoRef.current) inputVideoRef.current.currentTime = frac * inputDuration
-                  }}
-                >
-                  <div className="h-full bg-blue-500 rounded-full" style={{ width: `${inputDuration > 0 ? (inputTime / inputDuration) * 100 : 0}%` }} />
-                </div>
-                <span className="text-[10px] font-mono text-zinc-500 min-w-[60px] text-right">
-                  {inputTime.toFixed(1)}s / {inputDuration.toFixed(1)}s
-                </span>
-              </div>
-            )}
           </div>
 
-          {/* Center: Conditioning Preview */}
-          <div className="flex-1 flex flex-col border-r border-zinc-800 min-w-0">
-            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between">
+          {showConditioningPreview && (
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
               <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Conditioning</span>
-              <div className="flex gap-1">
-                {CONDITIONING_TYPES.map(ct => (
-                  <button
-                    key={ct.value}
-                    onClick={() => setConditioningType(ct.value)}
-                    className={`px-2 py-0.5 rounded text-[10px] transition-colors ${
-                      conditioningType === ct.value
-                        ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30'
-                        : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
-                    }`}
-                  >
-                    {ct.label}
-                  </button>
-                ))}
-              </div>
+              <button
+                onClick={() => { void extractConditioning() }}
+                disabled={!inputVideoPath || isExtracting}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3 w-3 ${isExtracting ? 'animate-spin' : ''}`} />
+              </button>
             </div>
             <div className="flex-1 bg-black flex items-center justify-center min-h-0 relative">
               {isExtracting && (
@@ -468,307 +615,137 @@ export function ICLoraPanel({
                 </div>
               )}
               {conditioningPreview ? (
-                <img src={conditioningPreview} alt="Conditioning preview" className="max-w-full max-h-full object-contain" />
+                <img src={conditioningPreview} alt="Conditioning preview" className="w-full h-full object-contain" />
               ) : (
                 <div className="text-center p-4">
                   <p className="text-zinc-600 text-xs">
-                    {inputVideoUrl ? 'Scrub the input video to see conditioning preview' : 'Import a video to see conditioning'}
+                    {inputVideoUrl ? 'Scrub the input video to see conditioning preview' : 'Import a video to preview conditioning'}
                   </p>
                 </div>
               )}
             </div>
-            <div className="px-3 py-1.5 border-t border-zinc-800 flex items-center justify-center">
-              <button
-                onClick={extractConditioning}
-                disabled={!inputVideoPath || isExtracting}
-                className="flex items-center gap-1.5 px-3 py-1 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors disabled:opacity-50"
-              >
-                <RefreshCw className={`h-3 w-3 ${isExtracting ? 'animate-spin' : ''}`} />
-                Refresh Preview
-              </button>
-            </div>
           </div>
+          )}
 
-          {/* Right: Output Video */}
+          {/* Reference image column: takes the conditioning slot for catalog IC-LoRAs that opt in. */}
+          {allowsReferenceImage && !showConditioningPreview && (
           <div className="flex-1 flex flex-col min-w-0">
-            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between">
-              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Output</span>
-              {outputVideoPath && (
+            <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider shrink-0">Reference</span>
+              {referenceImagePath && (
+                <span className="text-[10px] text-zinc-500 truncate min-w-0">
+                  {referenceImagePath.split(/[\\/]/).pop()}
+                </span>
+              )}
+              {referenceImagePath ? (
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={handleClearReference}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                    title="Clear reference image"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                  <button
+                    onClick={handleBrowseReference}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                    title="Replace reference image"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                  </button>
+                </div>
+              ) : (
                 <button
-                  onClick={handleAcceptOutput}
-                  className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                  onClick={handleBrowseReference}
+                  className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors shrink-0"
                 >
-                  {sourceClipId ? 'Add as Take' : 'Add to Assets'}
+                  <Upload className="h-3 w-3" />
+                  Import
                 </button>
               )}
             </div>
-            <div className="flex-1 bg-black flex items-center justify-center min-h-0 relative">
-              {isGenerating && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 z-10 gap-2">
-                  <Loader2 className="h-6 w-6 text-blue-400 animate-spin" />
-                  <span className="text-xs text-blue-300">{generationStatus}</span>
-                </div>
-              )}
-              {generationError && !isGenerating && !outputVideoUrl && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 z-10 gap-2 p-4">
-                  <AlertCircle className="h-6 w-6 text-red-400" />
-                  <span className="text-xs text-red-400 text-center">{generationError}</span>
+            <div
+              className={`flex-1 min-h-0 bg-black flex items-center justify-center relative ${!referenceImageUrl ? 'border-2 border-dashed border-zinc-700 m-3 rounded-lg' : ''} ${isReferenceDragOver ? 'border-blue-500 bg-blue-500/10' : ''}`}
+              onDragOver={(e) => { e.preventDefault(); setIsReferenceDragOver(true) }}
+              onDragLeave={() => setIsReferenceDragOver(false)}
+              onDrop={handleDropReference}
+            >
+              {referenceImageUrl ? (
+                <img src={referenceImageUrl} alt="Reference" className="w-full h-full object-contain" />
+              ) : (
+                <div className="text-center p-4">
+                  <div className="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center mx-auto mb-2">
+                    <ImageIcon className="h-6 w-6 text-zinc-600" />
+                  </div>
+                  <p className="text-zinc-400 text-xs">Drop or import a reference image</p>
                   <button
-                    onClick={() => setGenerationError(null)}
-                    className="mt-1 text-xs text-zinc-400 hover:text-zinc-200 underline"
+                    onClick={handleBrowseReference}
+                    className="mt-2 px-3 py-1.5 text-[10px] text-blue-400 border border-blue-500/30 rounded-lg hover:bg-blue-600/10 transition-colors"
                   >
-                    Dismiss
+                    Import Image
                   </button>
                 </div>
               )}
-              {outputVideoUrl ? (
-                <video
-                  ref={outputVideoRef}
-                  src={outputVideoUrl}
-                  className="max-w-full max-h-full object-contain"
-                  controls
-                />
-              ) : !isGenerating && !generationError ? (
-                <div className="text-center p-4">
-                  <p className="text-zinc-600 text-xs">Output will appear here after generation</p>
-                </div>
-              ) : null}
             </div>
           </div>
-        </div>
-
-        {/* Bottom controls */}
-        <div className="flex-shrink-0 border-t border-zinc-800 px-5 py-3 space-y-2">
-          {/* Settings row (collapsible) */}
-          {showSettings && (
-            <div className="flex items-center gap-4 pb-2 border-b border-zinc-800 mb-2 flex-wrap">
-              <div className="flex items-center gap-1.5">
-                <label className="text-[10px] text-zinc-500">Width</label>
-                <input type="number" value={width} onChange={e => setWidth(Number(e.target.value))}
-                  className="w-16 bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-[10px] text-white" />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <label className="text-[10px] text-zinc-500">Height</label>
-                <input type="number" value={height} onChange={e => setHeight(Number(e.target.value))}
-                  className="w-16 bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-[10px] text-white" />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <label className="text-[10px] text-zinc-500">Frames</label>
-                <input type="number" value={numFrames} onChange={e => setNumFrames(Number(e.target.value))}
-                  className="w-16 bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-[10px] text-white" />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <label className="text-[10px] text-zinc-500">FPS</label>
-                <input type="number" value={frameRate} onChange={e => setFrameRate(Number(e.target.value))}
-                  className="w-14 bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-[10px] text-white" />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <label className="text-[10px] text-zinc-500">Seed</label>
-                <input type="number" value={seed} onChange={e => setSeed(Number(e.target.value))}
-                  className="w-20 bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-[10px] text-white" />
-              </div>
-            </div>
           )}
 
-          {/* Reference images row */}
-          <div className="flex items-center gap-2 pb-2 border-b border-zinc-800 mb-2">
-            <span className="text-[10px] text-zinc-500 whitespace-nowrap">Reference Images</span>
-            <div className="flex items-center gap-2 flex-1 overflow-x-auto min-h-[48px]">
-              {refImages.map((img, i) => (
-                <div key={i} className="relative flex-shrink-0 group">
-                  <img src={img.url} alt={`Ref ${i + 1}`} className="h-10 w-14 object-cover rounded border border-zinc-700" />
-                  <button
-                    onClick={() => handleRemoveImage(i)}
-                    className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-red-600 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                  >
-                    <X className="h-2 w-2 text-white" />
-                  </button>
-                  <div className="flex items-center gap-1 mt-0.5">
-                    <label className="text-[8px] text-zinc-600">Fr</label>
-                    <input
-                      type="number" min="0" value={img.frame}
-                      onChange={e => handleUpdateImage(i, { frame: Number(e.target.value) })}
-                      className="w-8 bg-zinc-800 border border-zinc-700 rounded px-0.5 text-[8px] text-white text-center"
-                    />
-                    <label className="text-[8px] text-zinc-600">S</label>
-                    <input
-                      type="number" min="0" max="2" step="0.1" value={img.strength}
-                      onChange={e => handleUpdateImage(i, { strength: Number(e.target.value) })}
-                      className="w-8 bg-zinc-800 border border-zinc-700 rounded px-0.5 text-[8px] text-white text-center"
-                    />
-                  </div>
-                </div>
-              ))}
-              <button
-                onClick={handleImportImage}
-                className="flex-shrink-0 h-10 w-14 border border-dashed border-zinc-700 rounded flex flex-col items-center justify-center text-zinc-600 hover:text-zinc-400 hover:border-zinc-500 transition-colors"
-              >
-                <Upload className="h-3 w-3" />
-                <span className="text-[7px] mt-0.5">Add</span>
-              </button>
+          {/* Canvas editor column: takes the middle slot for outpainting (position_canvas control). */}
+          {showOutpaintCanvas && !showConditioningPreview && (
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="px-3 py-2 border-b border-zinc-800 flex items-center">
+              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Canvas</span>
             </div>
+            {sourceDims && outpaintPads ? (
+              <OutpaintCanvasEditor
+                sourceWidth={sourceDims.w}
+                sourceHeight={sourceDims.h}
+                value={outpaintPads}
+                onChange={(p) => onOutpaintPadsChange?.(p)}
+              />
+            ) : (
+              <div className="flex-1 bg-black flex items-center justify-center">
+                <p className="text-zinc-600 text-xs">Import a video to set the outpaint canvas</p>
+              </div>
+            )}
           </div>
+          )}
 
-          {/* Main controls row */}
-          <div className="flex items-center gap-3">
-            {/* LoRA model picker */}
-            <div className="relative">
-              <button
-                onClick={() => setShowModelDropdown(!showModelDropdown)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-750 text-xs text-zinc-300 transition-colors min-w-[180px]"
-              >
-                <Sparkles className="h-3 w-3 text-blue-400 flex-shrink-0" />
-                <span className="flex-1 text-left truncate">
-                  {selectedModel ? selectedModel.name : 'Select LoRA model...'}
-                </span>
-                <ChevronDown className="h-3 w-3 text-zinc-500 flex-shrink-0" />
-              </button>
-              {showModelDropdown && (
-                <div className="absolute bottom-full left-0 mb-1 w-80 bg-zinc-800 rounded-lg border border-zinc-700 shadow-xl z-50 overflow-hidden max-h-[320px] overflow-y-auto">
-                  {/* Installed models */}
-                  {models.length > 0 && (
-                    <>
-                      <div className="px-3 py-1.5 text-[9px] text-zinc-500 uppercase tracking-wider font-semibold bg-zinc-800/80 border-b border-zinc-700/50">
-                        Installed Models
-                      </div>
-                      {models.map(m => (
-                        <button
-                          key={m.path}
-                          onClick={() => { setSelectedModel(m); setShowModelDropdown(false) }}
-                          className={`w-full text-left px-3 py-2 text-[11px] hover:bg-zinc-700 transition-colors ${
-                            selectedModel?.path === m.path ? 'bg-blue-600/15 text-blue-300' : 'text-zinc-300'
-                          }`}
-                        >
-                          <div className="font-medium">{m.name}</div>
-                          <div className="text-[9px] text-zinc-500 mt-0.5">
-                            Type: {m.conditioning_type} | Scale: {m.reference_downscale_factor}x
-                          </div>
-                        </button>
-                      ))}
-                    </>
-                  )}
-
-                  {/* Official models to download — only show ones NOT yet installed */}
-                  {(() => {
-                    const notInstalled = OFFICIAL_IC_LORA_MODELS.filter(
-                      m => !models.some(inst => inst.path.includes(m.filename))
-                    )
-                    if (notInstalled.length === 0) return null
-                    return (
-                      <>
-                        <div className="px-3 py-1.5 text-[9px] text-zinc-500 uppercase tracking-wider font-semibold bg-zinc-800/80 border-b border-zinc-700/50 border-t border-zinc-700/50">
-                          Download Official Models
-                        </div>
-                        {notInstalled.map(m => {
-                          const dlState = downloadingModels[m.id]
-                          return (
-                            <div
-                              key={m.id}
-                              className="flex items-center px-3 py-2 text-[11px] hover:bg-zinc-700/50 transition-colors"
-                            >
-                              <div className="flex-1 min-w-0">
-                                <div className="font-medium text-zinc-300">{m.label}</div>
-                                <div className="text-[9px] text-zinc-500 truncate">{m.repo_id}</div>
-                              </div>
-                              {dlState === 'downloading' ? (
-                                <span className="flex items-center gap-1 text-[10px] text-amber-400 flex-shrink-0">
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                  Downloading...
-                                </span>
-                              ) : dlState === 'done' ? (
-                                <span className="flex items-center gap-1 text-[10px] text-green-400 flex-shrink-0">
-                                  <Check className="h-3 w-3" />
-                                  Done
-                                </span>
-                              ) : dlState === 'error' ? (
-                                <button
-                                  onClick={() => handleDownloadModel(m)}
-                                  className="flex items-center gap-1 text-[10px] text-red-400 hover:text-red-300 flex-shrink-0"
-                                >
-                                  <Download className="h-3 w-3" />
-                                  Retry
-                                </button>
-                              ) : (
-                                <button
-                                  onClick={() => handleDownloadModel(m)}
-                                  className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 flex-shrink-0"
-                                >
-                                  <Download className="h-3 w-3" />
-                                  Download
-                                </button>
-                              )}
-                            </div>
-                          )
-                        })}
-                      </>
-                    )
-                  })()}
-
-                  {/* Browse custom */}
-                  <div className="border-t border-zinc-700">
-                    <button
-                      onClick={handleBrowseLora}
-                      className="w-full text-left px-3 py-2 text-[11px] text-zinc-400 hover:bg-zinc-700 hover:text-white flex items-center gap-2 transition-colors"
-                    >
-                      <FolderOpen className="h-3 w-3" />
-                      Browse for custom LoRA...
-                    </button>
-                  </div>
+          {/* Output column */}
+          <div className="flex-1 flex flex-col border-l border-zinc-800 min-w-0">
+            <div className="px-3 py-2 border-b border-zinc-800 flex items-center">
+              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Output</span>
+            </div>
+            <div className="flex-1 bg-black flex items-center justify-center min-h-0 relative">
+              {_outputVideoPath ? (
+                <video
+                  src={pathToFileUrl(_outputVideoPath)}
+                  className="w-full h-full object-contain"
+                  controls
+                />
+              ) : isProcessing ? (
+                <div className="text-center p-4">
+                  <Loader2 className="h-6 w-6 text-blue-400 animate-spin mx-auto mb-2" />
+                  <p className="text-zinc-400 text-xs">{processingStatus || 'Generating...'}</p>
                 </div>
-              )}
-            </div>
-
-            {/* Conditioning strength */}
-            <div className="flex items-center gap-1.5">
-              <label className="text-[10px] text-zinc-500 whitespace-nowrap">Strength</label>
-              <input
-                type="range" min="0" max="2" step="0.05" value={conditioningStrength}
-                onChange={e => setConditioningStrength(Number(e.target.value))}
-                className="w-20 accent-blue-500"
-              />
-              <span className="text-[10px] text-zinc-400 min-w-[28px]">{conditioningStrength.toFixed(2)}</span>
-            </div>
-
-            {/* Prompt */}
-            <div className="flex-1">
-              <input
-                type="text"
-                value={prompt}
-                onChange={e => setPrompt(e.target.value)}
-                disabled={isGenerating}
-                placeholder="Describe the output style or content..."
-                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-zinc-600 focus:outline-none focus:border-blue-500 transition-colors disabled:opacity-50"
-              />
-            </div>
-
-            {/* Generate button */}
-            <div className="relative group">
-              <button
-                onClick={handleGenerate}
-                disabled={!inputVideoPath || !selectedModel || isGenerating || !prompt.trim()}
-                className="flex items-center gap-1.5 px-5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {isGenerating ? (
-                  <>
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    Generating...
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="h-3 w-3" />
-                    Generate
-                  </>
-                )}
-              </button>
-              {(!inputVideoPath || !selectedModel || !prompt.trim()) && !isGenerating && (
-                <div className="absolute bottom-full right-0 mb-1.5 px-2.5 py-1.5 bg-zinc-800 border border-zinc-700 rounded-lg text-[10px] text-zinc-400 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-lg">
-                  {!inputVideoPath ? 'Import a driving video first' : !selectedModel ? 'Select a LoRA model first' : 'Enter a prompt first'}
+              ) : (
+                <div className="text-center p-4">
+                  <p className="text-zinc-600 text-xs">Output video will appear here</p>
                 </div>
               )}
             </div>
           </div>
         </div>
-      </div>
+      )}
+
+      {extractError && (
+        <div className="px-4 py-3 border-t border-zinc-800 flex-shrink-0">
+          <div className="flex items-center gap-2 text-xs text-red-400">
+            <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+            <span>{extractError}</span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

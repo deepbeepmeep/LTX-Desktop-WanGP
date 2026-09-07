@@ -73,7 +73,8 @@ export async function sendAnalyticsEvent(
       writeAppState(state)
     }
 
-    const platform = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'windows' : 'linux'
+    const platformNames: Record<string, string> = { darwin: 'mac', win32: 'windows', linux: 'linux' }
+    const platform = platformNames[process.platform] ?? process.platform
     const now = Date.now()
 
     const payload = {

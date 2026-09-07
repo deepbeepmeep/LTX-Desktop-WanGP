@@ -17,6 +17,12 @@ class A2VPipeline(Protocol):
         gemma_root: str | None,
         upsampler_path: str,
         device: torch.device,
+        streaming_prefetch_count: int | None,
+        loras: list[tuple[str, float]] | None = None,
+        *,
+        video_vae_path: str | None = None,
+        audio_vae_path: str | None = None,
+        duration_head_path: str | None = None,
     ) -> "A2VPipeline": ...
 
     def generate(

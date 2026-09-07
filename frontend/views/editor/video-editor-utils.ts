@@ -5,8 +5,8 @@ import {
 } from 'lucide-react'
 import { formatKeyCombo, type ActionId, type KeyboardLayout } from '../../lib/keyboard-shortcuts'
 export type { KeyboardLayout } from '../../lib/keyboard-shortcuts'
-import type { TimelineClip, TransitionType, Track, ClipEffect, EffectMask } from '../../types/project'
-import { DEFAULT_COLOR_CORRECTION } from '../../types/project'
+import type { TimelineClip, TransitionType, Track, ClipEffect, EffectMask } from '../../types/project-model'
+import { DEFAULT_COLOR_CORRECTION } from '../../types/project-model'
 
 // ── Tool types & definitions ────────────────────────────────────────
 
@@ -60,15 +60,6 @@ export function getColorLabel(id: string | undefined): ColorLabelDef | undefined
 
 /** Debounce delay for auto-saving timeline changes to context (ms) */
 export const AUTOSAVE_DELAY = 500
-
-/** Max number of undo steps */
-export const MAX_UNDO_HISTORY = 50
-
-/** Undo action types */
-export type UndoAction =
-  | { type: 'clips'; clips: TimelineClip[] }
-  | { type: 'assets'; assets: import('../../types/project').Asset[] }
-  | { type: 'tracks'; tracks: import('../../types/project').Track[]; clips: TimelineClip[]; subtitles: import('../../types/project').SubtitleClip[] }
 
 /** Tolerance in seconds for detecting adjacent clips (cut points) */
 export const CUT_POINT_TOLERANCE = 0.05

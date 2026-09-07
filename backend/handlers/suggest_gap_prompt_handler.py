@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from api_types import (
     SuggestGapPromptRequest,
@@ -12,40 +13,25 @@ from api_types import (
 )
 from _routes._errors import HTTPError
 from handlers.base import StateHandlerBase
-from pydantic import BaseModel, Field, ValidationError
-from server_utils.media_validation import normalize_optional_path, validate_image_file
-from services.interfaces import HTTPClient, HttpTimeoutError, JSONValue
+from server_utils.media_validation import image_mime_type, normalize_optional_path, validate_image_file
+from services.gemini_text_client import (
+    apply_gemini_thinking_config,
+    call_gemini_generate_content,
+    resolve_gemini_model,
+)
+from services.interfaces import HTTPClient, JSONValue
 from state.app_state_types import AppState
+
+if TYPE_CHECKING:
+    from runtime_config.runtime_config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
 
-class _GeminiPart(BaseModel):
-    text: str
-
-
-class _GeminiContent(BaseModel):
-    parts: list[_GeminiPart] = Field(min_length=1)
-
-
-class _GeminiCandidate(BaseModel):
-    content: _GeminiContent
-
-
-class _GeminiResponsePayload(BaseModel):
-    candidates: list[_GeminiCandidate] = Field(min_length=1)
-
-
-def _extract_gemini_text(payload: object) -> str:
-    try:
-        parsed = _GeminiResponsePayload.model_validate(payload)
-    except ValidationError:
-        raise HTTPError(500, "GEMINI_PARSE_ERROR")
-    return parsed.candidates[0].content.parts[0].text
-
-
-def _read_image_file_as_base64(file_path: str | None) -> str | None:
-    """Read an image file from disk and return its contents as base64."""
+def _read_image_file_as_base64(file_path: str | None) -> tuple[str, str] | None:
+    """Read an image file from disk and return (base64 data, real MIME type) — the real format,
+    not a hardcoded guess, since Gemini's inlineData needs the declared type to match the bytes.
+    """
     normalized = normalize_optional_path(file_path)
     if not normalized:
         return None
@@ -55,15 +41,16 @@ def _read_image_file_as_base64(file_path: str | None) -> str | None:
         logger.warning("Ignoring invalid image file for gap prompt: %s (%s)", normalized, exc.detail)
         return None
     try:
-        return base64.b64encode(validated_path.read_bytes()).decode()
+        data = base64.b64encode(validated_path.read_bytes()).decode()
+        return data, image_mime_type(str(validated_path))
     except Exception:
         logger.warning("Failed to read image file for gap prompt: %s", normalized, exc_info=True)
         return None
 
 
 class SuggestGapPromptHandler(StateHandlerBase):
-    def __init__(self, state: AppState, lock: RLock, http: HTTPClient) -> None:
-        super().__init__(state, lock)
+    def __init__(self, state: AppState, lock: RLock, config: RuntimeConfig, http: HTTPClient) -> None:
+        super().__init__(state, lock, config)
         self._http = http
 
     def suggest_gap(self, req: SuggestGapPromptRequest) -> SuggestGapPromptResponse:
@@ -82,8 +69,8 @@ class SuggestGapPromptHandler(StateHandlerBase):
         if not gemini_api_key:
             raise HTTPError(400, "GEMINI_API_KEY_MISSING")
 
-        is_image_gen = mode in ("text-to-image", "t2i")
-        is_image_to_video = mode in ("image-to-video", "i2v")
+        is_image_gen = mode == "text-to-image"
+        is_image_to_video = mode == "image-to-video"
         if not is_image_to_video:
             input_image = None
 
@@ -126,40 +113,39 @@ class SuggestGapPromptHandler(StateHandlerBase):
         user_parts: list[JSONValue] = [{"text": context_text}]
 
         if input_image:
+            data, mime_type = input_image
             user_parts.append({"text": "Reference image for the start of the generated shot:"})
-            user_parts.append({"inlineData": {"mimeType": "image/jpeg", "data": input_image}})
+            user_parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
         if before_frame:
+            data, mime_type = before_frame
             user_parts.append({"text": "Last frame of the shot BEFORE the gap:"})
-            user_parts.append({"inlineData": {"mimeType": "image/jpeg", "data": before_frame}})
+            user_parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
         if after_frame:
+            data, mime_type = after_frame
             user_parts.append({"text": "First frame of the shot AFTER the gap:"})
-            user_parts.append({"inlineData": {"mimeType": "image/jpeg", "data": after_frame}})
+            user_parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
 
-        gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         contents: list[JSONValue] = [{"role": "user", "parts": user_parts}]
-        system_instruction: dict[str, JSONValue] = {"parts": [{"text": system_text}]}
-        generation_config: dict[str, JSONValue] = {"temperature": 0.7, "maxOutputTokens": 512}
-        gemini_payload: dict[str, JSONValue] = {
-            "contents": contents,
-            "systemInstruction": system_instruction,
-            "generationConfig": generation_config,
-        }
 
         try:
-            response = self._http.post(
-                gemini_url,
-                headers={"Content-Type": "application/json", "x-goog-api-key": gemini_api_key},
-                json_payload=gemini_payload,
+            resolved_model = resolve_gemini_model(self.state.app_settings.gemini_model)
+            logger.info("Suggesting gap prompt via Gemini API (%s)", resolved_model)
+            suggested_prompt = call_gemini_generate_content(
+                self._http,
+                api_key=gemini_api_key,
+                model=resolved_model,
+                contents=contents,
+                system_instruction=system_text,
+                generation_config=apply_gemini_thinking_config(
+                    resolved_model,
+                    {"temperature": 0.7, "maxOutputTokens": 512},
+                ),
                 timeout=30,
             )
-        except HttpTimeoutError as exc:
-            raise HTTPError(504, "Gemini API request timed out") from exc
+        except HTTPError as exc:
+            logger.error("Gemini gap suggestion error: %s", exc.detail)
+            raise
         except Exception as exc:
             raise HTTPError(500, str(exc)) from exc
 
-        if response.status_code != 200:
-            logger.error("Gemini gap suggestion error: %s - %s", response.status_code, response.text)
-            raise HTTPError(response.status_code, f"Gemini API error: {response.text}")
-
-        suggested_prompt = _extract_gemini_text(response.json()).strip()
         return SuggestGapPromptResponse(status="success", suggested_prompt=suggested_prompt)

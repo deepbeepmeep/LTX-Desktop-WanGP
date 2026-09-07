@@ -2,22 +2,76 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import pickle
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 import torch
 
+from runtime_config.ltx_api_text_encoder_ids import LtxApiPromptEmbeddingModel
 from services.http_client.http_client import HTTPClient
-from services.services_utils import PromptInput, TensorOrNone, sync_device
-from state.app_state_types import CachedTextEncoder, TextEncodingResult
+from services.services_utils import JSONValue
+from state.app_state_types import TextEncodingResult
 
 if TYPE_CHECKING:
     from state.app_state_types import AppState
 
 logger = logging.getLogger(__name__)
+
+# Exact GLOBAL/STACK_GLOBAL symbols in a torch tensor pickle (protocols 2/4/5),
+# including CUDA tensors the LTX API emits. Anything else — including other
+# torch.* callables — is refused so a MITM'd /v1/prompt-embedding body cannot
+# name os.system, torch.jit, etc.
+_ALLOWED_PICKLE_GLOBALS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch.storage", "_load_from_bytes"),
+        ("collections", "OrderedDict"),
+        ("_codecs", "encode"),
+    }
+)
+
+
+class _CpuUnpickler(pickle.Unpickler):
+    """Unpickler that maps torch storages to CPU on load.
+
+    The LTX API returns conditioning pickled with tensors that were on CUDA. Plain
+    ``pickle.loads`` routes each storage through ``torch.storage._load_from_bytes`` ->
+    ``torch.load`` with no ``map_location``, which raises on a machine without CUDA
+    (Apple Silicon / CPU-only). Overriding that one symbol injects ``map_location='cpu'``
+    so the tensors deserialize on CPU; callers then ``.to(device)`` as needed.
+    """
+
+    def find_class(self, module: str, name: str) -> Any:
+        if (module, name) not in _ALLOWED_PICKLE_GLOBALS:
+            raise pickle.UnpicklingError(f"disallowed pickle global: {module}.{name}")
+        if module == "torch.storage" and name == "_load_from_bytes":
+
+            def _load_from_bytes_cpu(b: bytes) -> Any:
+                return torch.load(io.BytesIO(b), map_location="cpu", weights_only=True)
+
+            return _load_from_bytes_cpu
+        return super().find_class(module, name)
+
+
+def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
+    return isinstance(value, (list, tuple))
+
+
+def _first_embedding_tensor(conditioning: object) -> torch.Tensor:
+    """Pull ``conditioning[0][0]`` only if the nest is sequences of a tensor."""
+    if not _is_sequence(conditioning) or len(conditioning) == 0:
+        raise pickle.UnpicklingError("unexpected conditioning container")
+    first = conditioning[0]
+    if not _is_sequence(first) or len(first) == 0:
+        raise pickle.UnpicklingError("unexpected conditioning row")
+    embeddings = first[0]
+    if not isinstance(embeddings, torch.Tensor):
+        raise pickle.UnpicklingError("conditioning is not a tensor")
+    return embeddings
 
 
 class LTXTextEncoder:
@@ -27,73 +81,117 @@ class LTXTextEncoder:
         self.device = device
         self.http = http
         self.ltx_api_base_url = ltx_api_base_url
-        self._model_ledger_patched = False
-        self._encode_text_patched = False
+        self._prompt_encoder_init_patched = False
+        self._prompt_encoder_patched = False
+        self._cleanup_memory_patched = False
 
     def install_patches(self, state_getter: Callable[[], AppState]) -> None:
-        self._install_model_ledger_patch(state_getter)
-        self._install_encode_text_patch(state_getter)
+        self._install_prompt_encoder_init_patch()
+        self._install_prompt_encoder_patch(state_getter)
+        self._install_cleanup_memory_patch(state_getter)
 
-    def _install_model_ledger_patch(self, state_getter: Callable[[], AppState]) -> None:
-        if self._model_ledger_patched:
+    def _install_prompt_encoder_init_patch(self) -> None:
+        """Patch PromptEncoder.__init__ to accept a text-encoder-less ModelPaths (API encoding mode).
+
+        In API encoding mode, text encoding is done remotely, so there is no local gemma root
+        -- ``model_paths.text_encoder_path`` is None. The upstream PromptEncoder eagerly resolves
+        file paths from it in __init__, which crashes. This patch short-circuits init when that
+        path is falsy, creating a stub that the __call__ patch will intercept before any model
+        loading.
+        """
+        if self._prompt_encoder_init_patched:
+            return
+        try:
+            from ltx_pipelines.utils.blocks import PromptEncoder
+            from ltx_pipelines.utils.model_paths import ModelPaths
+
+            original_init = PromptEncoder.__init__  # type: ignore[reportUnknownVariableType, reportUnknownMemberType]
+
+            def patched_init(
+                self_encoder: PromptEncoder,
+                model_paths: ModelPaths,
+                dtype: Any,
+                device: Any,
+                *args: Any,
+                **kwargs: Any,
+            ) -> None:
+                # Forward *args/**kwargs verbatim so this patch tracks the real
+                # PromptEncoder.__init__ signature (registry, offload_mode,
+                # text_encoder_builder, ...) instead of pinning a fixed arg list.
+                if not model_paths.text_encoder_path:
+                    self_encoder._dtype = dtype  # type: ignore[attr-defined]
+                    self_encoder._device = device  # type: ignore[attr-defined]
+                    self_encoder._text_encoder_builder = None  # type: ignore[attr-defined]
+                    self_encoder._embeddings_processor_builder = None  # type: ignore[attr-defined]
+                    return
+                original_init(self_encoder, model_paths, dtype, device, *args, **kwargs)
+
+            PromptEncoder.__init__ = patched_init  # type: ignore[assignment]
+            self._prompt_encoder_init_patched = True
+            logger.info("Installed PromptEncoder.__init__ patch for text-encoder-less ModelPaths")
+        except Exception as exc:
+            logger.warning("Failed to patch PromptEncoder.__init__: %s", exc, exc_info=True)
+
+    def _install_prompt_encoder_patch(self, state_getter: Callable[[], AppState]) -> None:
+        """Patch PromptEncoder.__call__ to use API embeddings when available."""
+        if self._prompt_encoder_patched:
             return
 
         try:
-            from ltx_pipelines.utils import ModelLedger
-            from ltx_pipelines.utils import helpers as ltx_utils
+            from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
+            from ltx_pipelines.utils.blocks import PromptEncoder
 
-            original_text_encoder = ModelLedger.text_encoder
-            original_cleanup_memory = ltx_utils.cleanup_memory
+            original_call = PromptEncoder.__call__
 
-            def _quantize_linear_weights_fp8(module: object) -> None:
-                """Cast all Linear weights to float8_e4m3fn and patch forward to upcast."""
-                for child in module.modules():  # type: ignore[union-attr]
-                    if not isinstance(child, torch.nn.Linear):
-                        continue
-                    child.weight.data = child.weight.data.to(torch.float8_e4m3fn)
-                    if child.bias is not None:  # pyright: ignore[reportUnnecessaryComparison]
-                        child.bias.data = child.bias.data.to(torch.float8_e4m3fn)
-
-                    def _make_upcast_forward(lin: torch.nn.Linear) -> Callable[..., torch.Tensor]:
-                        def _fwd(x: torch.Tensor, **kw: object) -> torch.Tensor:
-                            w = lin.weight.to(x.dtype)
-                            b = lin.bias.to(x.dtype) if lin.bias is not None else None  # pyright: ignore[reportUnnecessaryComparison]
-                            return torch.nn.functional.linear(x, w, b)
-                        return _fwd
-
-                    child.forward = _make_upcast_forward(child)  # type: ignore[assignment]
-
-            def patched_text_encoder(self_model_ledger: ModelLedger) -> object:
+            def patched_call(
+                self_encoder: PromptEncoder,
+                prompts: list[str],
+                **kwargs: Any,
+            ) -> list[EmbeddingsProcessorOutput]:
                 state = state_getter()
                 te_state = state.text_encoder
-                if te_state is None:
-                    return original_text_encoder(self_model_ledger)
+                if te_state is not None and te_state.api_embeddings is not None:
+                    video_context = te_state.api_embeddings.video_context
+                    audio_context = te_state.api_embeddings.audio_context
+                    # Create a dummy attention mask matching the sequence length
+                    seq_len = video_context.shape[1] if video_context.dim() > 1 else 1
+                    dummy_mask = torch.ones(1, seq_len, device=video_context.device)
+                    results: list[EmbeddingsProcessorOutput] = []
+                    for i in range(len(prompts)):
+                        if i == 0:
+                            results.append(EmbeddingsProcessorOutput(
+                                video_encoding=video_context,
+                                audio_encoding=audio_context,
+                                attention_mask=dummy_mask,
+                            ))
+                        else:
+                            zero_video = torch.zeros_like(video_context)
+                            zero_audio = torch.zeros_like(audio_context) if audio_context is not None else None
+                            results.append(EmbeddingsProcessorOutput(
+                                video_encoding=zero_video,
+                                audio_encoding=zero_audio,
+                                attention_mask=dummy_mask,
+                            ))
+                    return results
 
-                if te_state.api_embeddings is not None:
-                    return DummyTextEncoder()
+                return original_call(self_encoder, prompts, **kwargs)
 
-                if te_state.cached_encoder is not None:
-                    try:
-                        te_state.cached_encoder.to(self.device)
-                        sync_device(self.device)
-                    except Exception:
-                        logger.warning("Failed to move cached text encoder to %s", self.device, exc_info=True)
-                    return te_state.cached_encoder
+            PromptEncoder.__call__ = patched_call  # type: ignore[assignment]
 
-                saved_device = self_model_ledger.device
-                self_model_ledger.device = torch.device("cpu")
-                try:
-                    te_state.cached_encoder = cast(
-                        CachedTextEncoder, original_text_encoder(self_model_ledger)
-                    )
-                finally:
-                    self_model_ledger.device = saved_device
+            self._prompt_encoder_patched = True
+            logger.info("Installed PromptEncoder API embeddings patch")
+        except Exception as exc:
+            logger.warning("Failed to patch PromptEncoder: %s", exc, exc_info=True)
 
-                _quantize_linear_weights_fp8(te_state.cached_encoder)
+    def _install_cleanup_memory_patch(self, state_getter: Callable[[], AppState]) -> None:
+        """Patch cleanup_memory to move cached text encoder to CPU before cleanup."""
+        if self._cleanup_memory_patched:
+            return
 
-                te_state.cached_encoder.to(self.device)
-                sync_device(self.device)
-                return te_state.cached_encoder
+        try:
+            from ltx_pipelines.utils import helpers as ltx_utils
+
+            original_cleanup_memory = ltx_utils.cleanup_memory
 
             def patched_cleanup_memory() -> None:
                 state = state_getter()
@@ -105,7 +203,7 @@ class LTXTextEncoder:
                         logger.warning("Failed to move cached text encoder to CPU", exc_info=True)
                 original_cleanup_memory()
 
-            setattr(ModelLedger, "text_encoder", patched_text_encoder)
+            setattr(ltx_utils, "cleanup_memory", patched_cleanup_memory)
 
             for module_name in (
                 "ltx_pipelines.utils.helpers",
@@ -124,70 +222,10 @@ class LTXTextEncoder:
                 except Exception:
                     logger.warning("Failed to patch cleanup_memory for module %s", module_name, exc_info=True)
 
-            self._model_ledger_patched = True
-            logger.info("Installed ModelLedger text encoder patch")
+            self._cleanup_memory_patched = True
+            logger.info("Installed cleanup_memory patch")
         except Exception as exc:
-            logger.warning("Failed to patch ModelLedger: %s", exc, exc_info=True)
-
-    def _install_encode_text_patch(self, state_getter: Callable[[], AppState]) -> None:
-        if self._encode_text_patched:
-            return
-
-        try:
-            from ltx_core.text_encoders import gemma as text_enc_module
-            from ltx_pipelines import distilled as distilled_module
-
-            original_encode_text = text_enc_module.encode_text
-
-            def patched_encode_text(
-                text_encoder: object,
-                prompts: PromptInput,
-                *args: object,
-                **kwargs: object,
-            ) -> list[tuple[torch.Tensor, TensorOrNone]]:
-                state = state_getter()
-                te_state = state.text_encoder
-                if te_state is not None and te_state.api_embeddings is not None:
-                    video_context = te_state.api_embeddings.video_context
-                    audio_context = te_state.api_embeddings.audio_context
-                    num_prompts = len(prompts) if not isinstance(prompts, str) else 1
-                    out: list[tuple[torch.Tensor, TensorOrNone]] = []
-                    for i in range(num_prompts):
-                        if i == 0:
-                            out.append((video_context, audio_context))
-                        else:
-                            zero_video = torch.zeros_like(video_context)
-                            zero_audio = torch.zeros_like(audio_context) if audio_context is not None else None
-                            out.append((zero_video, zero_audio))
-                    return out
-
-                prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
-                return cast(
-                    list[tuple[torch.Tensor, TensorOrNone]],
-                    original_encode_text(cast(Any, text_encoder), prompt_list, *args, **kwargs),
-                )
-
-            setattr(text_enc_module, "encode_text", patched_encode_text)
-            setattr(distilled_module, "encode_text", patched_encode_text)
-
-            for module_name in (
-                "ltx_pipelines.ti2vid_one_stage",
-                "ltx_pipelines.ti2vid_two_stages",
-                "ltx_pipelines.ic_lora",
-                "ltx_pipelines.a2vid_two_stage",
-                "ltx_pipelines.retake",
-                "ltx_pipelines.retake_pipeline",
-            ):
-                try:
-                    module = __import__(module_name, fromlist=["encode_text"])
-                    setattr(module, "encode_text", patched_encode_text)
-                except Exception:
-                    logger.warning("Failed to patch encode_text for module %s", module_name, exc_info=True)
-
-            self._encode_text_patched = True
-            logger.info("Installed encode_text API embeddings patch")
-        except Exception as exc:
-            logger.warning("Failed to patch encode_text: %s", exc, exc_info=True)
+            logger.warning("Failed to patch cleanup_memory: %s", exc, exc_info=True)
 
     def get_model_id_from_checkpoint(self, checkpoint_path: str) -> str | None:
         try:
@@ -201,10 +239,33 @@ class LTXTextEncoder:
             logger.warning("Could not extract model_id from checkpoint: %s", exc, exc_info=True)
         return None
 
-    def encode_via_api(self, prompt: str, api_key: str, checkpoint_path: str, enhance_prompt: bool) -> TextEncodingResult | None:
-        model_id = self.get_model_id_from_checkpoint(checkpoint_path)
-        if not model_id:
-            return None
+    def encode_via_api(
+        self,
+        prompt: str,
+        api_key: str,
+        checkpoint_path: str,
+        enhance_prompt: bool,
+        api_model: LtxApiPromptEmbeddingModel | None = None,
+    ) -> TextEncodingResult | None:
+        # Gateway XOR: exactly one of `model` (2.5+) or `model_id` (legacy 2.3 / Comfy).
+        json_payload: dict[str, JSONValue] = {
+            "prompt": prompt,
+            "enhance_prompt": enhance_prompt,
+        }
+        if api_model is not None:
+            json_payload["model"] = {
+                "ltx_version": api_model["ltx_version"],
+                "gemma_version": api_model["gemma_version"],
+            }
+        else:
+            model_id = self.get_model_id_from_checkpoint(checkpoint_path)
+            if not model_id:
+                logger.warning(
+                    "Checkpoint %s carries no API model selector; skipping LTX API text encoding",
+                    checkpoint_path,
+                )
+                return None
+            json_payload["model_id"] = model_id
 
         try:
             start = time.time()
@@ -214,11 +275,7 @@ class LTXTextEncoder:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json_payload={
-                    "prompt": prompt,
-                    "model_id": model_id,
-                    "enhance_prompt": enhance_prompt,
-                },
+                json_payload=json_payload,
                 timeout=60,
             )
 
@@ -226,12 +283,10 @@ class LTXTextEncoder:
                 logger.warning("LTX API error %s: %s", response.status_code, response.text)
                 return None
 
-            conditioning = pickle.loads(response.content)  # noqa: S301
-            if not conditioning or len(conditioning) == 0:
-                logger.warning("LTX API returned unexpected conditioning format")
-                return None
-
-            embeddings = conditioning[0][0]
+            # Map CUDA storages to CPU during unpickling so this works on non-CUDA hosts
+            # (Apple Silicon / CPU-only); the tensors are moved to self.device below.
+            conditioning = _CpuUnpickler(io.BytesIO(response.content)).load()  # noqa: S301
+            embeddings = _first_embedding_tensor(conditioning)
             video_dim = 4096
             if embeddings.shape[-1] > video_dim:
                 video_context = embeddings[..., :video_dim].contiguous().to(dtype=torch.bfloat16, device=self.device)

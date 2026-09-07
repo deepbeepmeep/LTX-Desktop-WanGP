@@ -40,9 +40,13 @@ uv sync --extra dev
 ok "uv sync complete"
 
 echo ""
-if [ "$SYSTEM_NAME" = "Darwin" ]; then
+if [ "$(uname -s)" = "Darwin" ]; then
   echo "Wan2GP local bridge remains disabled on macOS; the checkout is cloned for repo parity and packaging."
   echo ""
+
+# Verify torch + accelerator
+echo ""
+if [ "$(uname -s)" = "Darwin" ]; then
   echo "Verifying PyTorch MPS support..."
   .venv/bin/python -c "import torch; mps=hasattr(torch.backends,'mps') and torch.backends.mps.is_available(); print(f'MPS available: {mps}')" || true
 else
@@ -54,12 +58,12 @@ echo ""
 if command -v ffmpeg >/dev/null 2>&1; then
   ok "ffmpeg found: $(ffmpeg -version 2>&1 | head -1)"
 else
-  if [ "$SYSTEM_NAME" = "Darwin" ]; then
-    echo "WARN ffmpeg not found - install with: brew install ffmpeg"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "⚠  ffmpeg not found — install with: brew install ffmpeg"
   else
-    echo "WARN ffmpeg not found - install with: sudo apt install ffmpeg  (or sudo dnf install ffmpeg)"
+    echo "⚠  ffmpeg not found — install with: sudo apt install ffmpeg  (or sudo dnf install ffmpeg)"
   fi
-  echo "     imageio-ffmpeg bundled binary will be used as fallback"
+  echo "   (imageio-ffmpeg bundled binary will be used as fallback)"
 fi
 
 echo ""

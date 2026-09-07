@@ -21,10 +21,10 @@ LTX Desktop is an Electron app for AI video generation using LTX models. Three-l
 | `pnpm typecheck:py` | Python pyright only |
 | `pnpm backend:test` | Run Python pytest tests |
 | `pnpm build:frontend` | Vite frontend build only |
-| `pnpm build:mac` / `pnpm build:win` | Full platform builds |
-| `pnpm setup:dev:mac` / `pnpm setup:dev:win` | One-time dev environment setup |
+| `pnpm build` | Full platform build (auto-detects platform) |
+| `pnpm setup:dev` | One-time dev environment setup (auto-detects platform) |
 
-Run a single backend test: `cd backend && uv run pytest tests/test_generation.py -v --tb=short`
+Run a single backend test file via pnpm: `pnpm backend:test -- tests/test_ic_lora.py`
 
 ## CI Checks
 
@@ -34,9 +34,9 @@ PRs must pass: `pnpm typecheck` + `pnpm backend:test` + frontend Vite build.
 
 - **Path alias**: `@/*` maps to `frontend/*`
 - **State management**: React contexts only (`ProjectContext`, `AppSettingsContext`, `KeyboardShortcutsContext`) — no Redux/Zustand
-- **Routing**: View-based via `ProjectContext` with views: `home`, `project`, `playground`
+- **Routing**: View-based via `ProjectContext` with views: `home`, `project`
 - **IPC bridge**: All Electron communication through `window.electronAPI` (defined in `electron/preload.ts`)
-- **Backend calls**: Frontend calls `http://localhost:8000` directly
+- **Backend calls**: Always use `backendFetch` from `frontend/lib/backend.ts` for app backend HTTP requests (it attaches auth/session details). Do not call `fetch` directly for backend endpoints.
 - **Styling**: Tailwind with custom semantic color tokens via CSS variables; utilities from `class-variance-authority` + `clsx` + `tailwind-merge`
 - **No frontend tests** currently exist
 
@@ -80,6 +80,7 @@ Key patterns:
 - Python 3.13+ (per `.python-version`), managed with `uv`
 - Pyright strict mode (`backend/pyrightconfig.json`)
 - Dependencies in `backend/pyproject.toml`
+- Bumping `ltx-core` / `ltx-pipelines`: re-verify every `services.patches` import in `backend/ltx2_server.py` (private upstream monkey-patches). Drop a patch only if upstream now includes the fix.
 
 ## Key File Locations
 

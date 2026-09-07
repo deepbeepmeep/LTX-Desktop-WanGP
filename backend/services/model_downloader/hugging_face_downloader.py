@@ -13,47 +13,42 @@ from huggingface_hub import file_download, hf_hub_download, snapshot_download  #
 from tqdm.auto import tqdm as tqdm_auto  # type: ignore[reportUnknownVariableType]
 
 
-def _make_progress_tqdm_class(callback: Callable[[int, int], None]) -> type:
+def _make_progress_tqdm_class(callback: Callable[[int], None]) -> type:
     """Return a tqdm subclass that reports aggregated progress via *callback*.
 
-    ``snapshot_download`` spawns one tqdm instance per file in the snapshot.
-    All instances created from a single factory call share this mutable dict
-    so the callback reports total progress across all files in that snapshot.
+    Used for both single-file and snapshot downloads.  Snapshot downloads
+    spawn one tqdm instance per file; all instances share mutable state so
+    the callback reports total progress across every file in the download.
     """
-    # Shared across all tqdm instances created within one download call.
-    # Protected by a lock because snapshot_download runs parallel threads.
     lock = Lock()
-    shared: dict[str, int] = {"downloaded": 0, "total": 0}
+    shared: dict[str, int] = {"downloaded": 0}
 
     class _ProgressTqdm(tqdm_auto):  # type: ignore[reportUntypedBaseClass]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)  # type: ignore[reportUnknownMemberType]
-            if self.total is not None:
-                with lock:
-                    shared["total"] += int(self.total)
 
         def update(self, n: float | int | None = 1) -> bool | None:  # type: ignore[reportIncompatibleMethodOverride]
             result = super().update(n)
             if n is not None:
                 with lock:
                     shared["downloaded"] += int(n)
-                    downloaded, total = shared["downloaded"], shared["total"]
-                callback(downloaded, total)
+                callback(shared["downloaded"])
             return result
 
     return _ProgressTqdm
 
 
 @contextlib.contextmanager
-def _patch_http_get_progress(callback: Callable[[int, int], None]) -> Iterator[None]:
+def _patch_download_progress(callback: Callable[[int], None]) -> Iterator[None]:
     """Temporarily monkey-patch ``huggingface_hub.file_download.http_get``
-    to inject a custom tqdm bar that forwards progress to *callback*.
+    and ``xet_get`` to inject a custom tqdm bar that forwards progress to
+    *callback*.
 
     ``hf_hub_download`` does not expose a ``tqdm_class`` parameter (unlike
-    ``snapshot_download``), but its internal ``http_get`` accepts a private
-    ``_tqdm_bar`` kwarg.  We wrap ``http_get`` to inject our own bar when
-    the caller hasn't already provided one.
+    ``snapshot_download``), but its internal ``http_get`` and ``xet_get``
+    both accept a private ``_tqdm_bar`` kwarg.  We wrap them to inject our
+    own bar when the caller hasn't already provided one.
 
     See ``test_http_get_accepts_tqdm_bar`` — if that test breaks after a
     huggingface_hub upgrade, this patch needs to be revisited.
@@ -66,8 +61,20 @@ def _patch_http_get_progress(callback: Callable[[int, int], None]) -> Iterator[N
             kwargs["_tqdm_bar"] = tqdm_cls(disable=True)
         return original_http_get(*args, **kwargs)
 
+    xet_get_fn: Callable[..., Any] | None = getattr(file_download, "xet_get", None)
+
+    def _wrapped_xet_get(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("_tqdm_bar") is None:
+            kwargs["_tqdm_bar"] = tqdm_cls(disable=True)
+        assert xet_get_fn is not None
+        return xet_get_fn(*args, **kwargs)
+
     with patch.object(file_download, "http_get", _wrapped_http_get):
-        yield
+        if xet_get_fn is not None:
+            with patch.object(file_download, "xet_get", _wrapped_xet_get):
+                yield
+        else:
+            yield
 
 
 class HuggingFaceDownloader:
@@ -78,20 +85,22 @@ class HuggingFaceDownloader:
         repo_id: str,
         filename: str,
         local_dir: str,
-        on_progress: Callable[[int, int], None] | None = None,
+        token: str | None,
+        on_progress: Callable[[int], None] | None = None,
     ) -> Path:
-        ctx = _patch_http_get_progress(on_progress) if on_progress is not None else contextlib.nullcontext()
+        ctx = _patch_download_progress(on_progress) if on_progress is not None else contextlib.nullcontext()
         with ctx:
-            path: str = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=local_dir)
+            path: str = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=local_dir, token=token)
         return Path(path)
 
     def download_snapshot(
         self,
         repo_id: str,
         local_dir: str,
-        on_progress: Callable[[int, int], None] | None = None,
+        token: str | None,
+        on_progress: Callable[[int], None] | None = None,
     ) -> Path:
-        ctx = _patch_http_get_progress(on_progress) if on_progress is not None else contextlib.nullcontext()
+        ctx = _patch_download_progress(on_progress) if on_progress is not None else contextlib.nullcontext()
         with ctx:
-            path: str = snapshot_download(repo_id=repo_id, local_dir=local_dir)
+            path: str = snapshot_download(repo_id=repo_id, local_dir=local_dir, token=token)
         return Path(path)

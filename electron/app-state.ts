@@ -6,6 +6,8 @@ export interface AppState {
   analyticsEnabled?: boolean
   installationId?: string
   projectAssetsPath?: string
+  skippedUpdateVersion?: string
+  autoCheckUpdates?: boolean
   [key: string]: unknown
 }
 
@@ -35,17 +37,40 @@ export function getProjectAssetsPath(): string {
   if (cachedProjectAssetsPath) return cachedProjectAssetsPath
   const state = readAppState()
   if (state.projectAssetsPath) {
-    cachedProjectAssetsPath = state.projectAssetsPath
+    cachedProjectAssetsPath = path.resolve(state.projectAssetsPath)
     return cachedProjectAssetsPath
   }
-  const defaultPath = path.join(app.getPath('downloads'), 'Ltx Desktop Assets')
+  const defaultPath = path.resolve(path.join(app.getPath('downloads'), 'Ltx Desktop Assets'))
   cachedProjectAssetsPath = defaultPath
   return defaultPath
 }
 
 export function setProjectAssetsPath(p: string): void {
-  cachedProjectAssetsPath = p
+  const resolvedPath = path.resolve(p)
+  cachedProjectAssetsPath = resolvedPath
   const state = readAppState()
-  state.projectAssetsPath = p
+  state.projectAssetsPath = resolvedPath
   writeAppState(state)
+}
+
+export function getSkippedUpdateVersion(): string | undefined {
+  return readAppState().skippedUpdateVersion
+}
+
+export function setSkippedUpdateVersion(version: string | undefined): void {
+  const s = readAppState()
+  if (version) s.skippedUpdateVersion = version
+  else delete s.skippedUpdateVersion
+  writeAppState(s)
+}
+
+export function getAutoCheckUpdates(): boolean {
+  // Default ON: existing installs and fresh installs behave as before.
+  return readAppState().autoCheckUpdates ?? true
+}
+
+export function setAutoCheckUpdates(enabled: boolean): void {
+  const s = readAppState()
+  s.autoCheckUpdates = enabled
+  writeAppState(s)
 }

@@ -1,4 +1,5 @@
-import React from 'react'
+import { useState } from 'react'
+import { shallow } from 'zustand/vanilla/shallow'
 import {
   Trash2, FileVideo, FileImage, FileAudio, Layers, Type,
   FlipHorizontal2, FlipVertical2, ChevronDown, ChevronRight,
@@ -6,79 +7,95 @@ import {
   SunDim, Moon, RotateCcw, Film, // EFFECTS HIDDEN: removed EyeOff, Sparkles, Plus, X
   AlignLeft, AlignCenter, AlignRight,
 } from 'lucide-react'
-import type { Asset, TimelineClip, Track, ClipEffect, LetterboxSettings, TextOverlayStyle, TransitionType } from '../../types/project' // EFFECTS HIDDEN: removed EffectMask
-import { DEFAULT_COLOR_CORRECTION, DEFAULT_LETTERBOX, TEXT_PRESETS } from '../../types/project' // EFFECTS HIDDEN: removed EFFECT_DEFINITIONS, DEFAULT_EFFECT_MASK
+import type { Asset, TimelineClip, LetterboxSettings, TextOverlayStyle, TransitionType } from '../../types/project-model' // EFFECTS HIDDEN: removed EffectMask
+import { DEFAULT_COLOR_CORRECTION, DEFAULT_LETTERBOX } from '../../types/project-model' // EFFECTS HIDDEN: removed EFFECT_DEFINITIONS, DEFAULT_EFFECT_MASK
+import { TEXT_PRESETS } from '../../types/project'
+import { namedResolutionTier } from '../../lib/video-resolution'
 import { formatTime } from './video-editor-utils'
 import { Tooltip } from '../../components/ui/tooltip'
+import {
+  selectAssets,
+  selectSelectedClipAudioControls,
+  selectSelectedClipForProperties,
+  selectTracks,
+} from './editor-selectors'
+import { useEditorActions, useEditorStore } from './editor-store'
 
 interface ClipPropertiesPanelProps {
-  selectedClip: TimelineClip
-  clips: TimelineClip[]
-  tracks: Track[]
-  propertiesTab: 'properties' | 'metadata'
-  setPropertiesTab: (tab: 'properties' | 'metadata') => void
-  showFlip: boolean
-  setShowFlip: (v: boolean) => void
-  showTransitions: boolean
-  setShowTransitions: (v: boolean) => void
-  showAppliedEffects: boolean
-  setShowAppliedEffects: (v: boolean) => void
-  showColorCorrection: boolean
-  setShowColorCorrection: (v: boolean) => void
-  resolutionCache: Record<string, { width: number; height: number }>
-  rightPanelWidth: number
-  updateClip: (clipId: string, updates: Partial<TimelineClip>) => void
-  removeEffectFromClip: (clipId: string, effectId: string) => void
-  updateEffectOnClip: (clipId: string, effectId: string, updates: Partial<ClipEffect>) => void
-  handleDeleteTake: (clipId: string) => void
-  setShowEffectsBrowser: (v: boolean) => void
-  setI2vClipId: (v: string | null) => void
-  setI2vPrompt: (v: string) => void
-  i2vClipId: string | null
-  isRegenerating: boolean
-  getLiveAsset: (clip: TimelineClip) => Asset | null | undefined
-  getClipUrl: (clip: TimelineClip) => string | null
-  getClipResolution: (clip: TimelineClip) => { label: string; color: string; height: number } | null
-  getMaxClipDuration: (clip: TimelineClip) => number
-  handleRegenerate: (clipId: string) => void
-  handleCancelRegeneration: () => void
-  setClips: React.Dispatch<React.SetStateAction<TimelineClip[]>>
-  pushUndo: (currentClips?: TimelineClip[]) => void
-  handleClipTakeChange: (clipId: string, direction: 'prev' | 'next') => void
-  setSubtitleTrackStyleIdx: (v: number | null) => void
-  subtitleTrackStyleIdx: number | null
+  onCreateVideoFromImage: (clip: TimelineClip) => void
 }
 
 export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
   const {
-    selectedClip,
-    tracks,
-    propertiesTab,
-    setPropertiesTab,
-    showFlip,
-    setShowFlip,
-    showTransitions,
-    setShowTransitions,
-    // EFFECTS HIDDEN: showAppliedEffects, setShowAppliedEffects removed from destructuring
-    showColorCorrection,
-    setShowColorCorrection,
-    resolutionCache,
-    rightPanelWidth,
-    updateClip,
-    // EFFECTS HIDDEN: removeEffectFromClip, updateEffectOnClip, setShowEffectsBrowser removed from destructuring
-    handleDeleteTake,
-    setI2vClipId,
-    setI2vPrompt,
-    i2vClipId,
-    isRegenerating,
-    getLiveAsset,
-    getClipUrl,
-    getClipResolution,
-    getMaxClipDuration,
+    onCreateVideoFromImage,
   } = props
+  const {
+    deleteClipDisplayedTake,
+    setClipAudioLevel,
+    setClipAudioMuted,
+    updateClip,
+  } = useEditorActions()
+  const assets = useEditorStore(selectAssets)
+  const tracks = useEditorStore(selectTracks)
+  const selectedClip = useEditorStore(selectSelectedClipForProperties)
+  const clipAudioControls = useEditorStore(selectSelectedClipAudioControls, shallow)
+  if (!selectedClip) return null
+
+  const effectiveMuted = clipAudioControls?.muted ?? (selectedClip.muted || false)
+  const effectiveVolume = clipAudioControls?.volume ?? (selectedClip.volume ?? 1)
+
+  const getLiveAsset = (clip: TimelineClip): Asset | null | undefined => {
+    if (!clip.assetId) return clip.asset
+    return assets.find(asset => asset.id === clip.assetId) || clip.asset
+  }
+
+  const getMaxClipDuration = (clip: TimelineClip): number => {
+    const liveAsset = getLiveAsset(clip)
+    if (clip.type !== 'video' || !liveAsset?.duration) return Infinity
+    const mediaDuration = liveAsset.duration
+    const usableMedia = mediaDuration - clip.trimStart - clip.trimEnd
+    return Math.max(0.5, usableMedia / clip.speed)
+  }
+
+  const handleDeleteDisplayedTake = () => {
+    deleteClipDisplayedTake(selectedClip.id)
+  }
+
+  const [propertiesTab, setPropertiesTab] = useState<'properties' | 'metadata'>('properties')
+  const [showFlip, setShowFlip] = useState(false)
+  const [showTransitions, setShowTransitions] = useState(false)
+  const [showColorCorrection, setShowColorCorrection] = useState(false)
+
+  const getClipDimensions = (clip: TimelineClip): { width: number; height: number } | null => {
+    if (clip.type === 'audio') return null
+    const liveAsset = getLiveAsset(clip)
+    if (!liveAsset) return null
+
+    const takeIndex = clip.takeIndex ?? liveAsset.activeTakeIndex
+    if (liveAsset.takes && liveAsset.takes.length > 0 && takeIndex !== undefined) {
+      const idx = Math.max(0, Math.min(takeIndex, liveAsset.takes.length - 1))
+      const take = liveAsset.takes[idx]
+      if (take.width && take.height) {
+        return { width: take.width, height: take.height }
+      }
+    }
+
+    if (liveAsset.width && liveAsset.height) {
+      return { width: liveAsset.width, height: liveAsset.height }
+    }
+
+    return null
+  }
+
+  const isTextClip = selectedClip.type === 'text'
+  const hasPlaybackControls = selectedClip.type === 'video' || selectedClip.type === 'audio'
+  const hasAudioControls = selectedClip.type === 'video' || selectedClip.type === 'audio'
+  const hasVisualTransformControls = selectedClip.type === 'video' || selectedClip.type === 'image'
+  const hasTransitionControls = selectedClip.type === 'video' || selectedClip.type === 'image'
+  const hasColorCorrectionControls = selectedClip.type === 'video' || selectedClip.type === 'image'
 
   return (
-    <div className="flex-shrink-0 border-l border-zinc-800 bg-zinc-900 p-4 overflow-auto" style={{ width: rightPanelWidth }}>
+    <div className="h-full w-full flex-shrink-0 border-l border-zinc-800 bg-zinc-900 p-4 overflow-auto">
       {/* Tab header */}
       <div className="flex items-center gap-0 mb-4 border-b border-zinc-700">
         <button
@@ -106,9 +123,7 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
       {/* Metadata Tab */}
       {propertiesTab === 'metadata' && (() => {
         const liveAsset = getLiveAsset(selectedClip)
-        const clipUrl = getClipUrl(selectedClip) || selectedClip.asset?.url || selectedClip.importedUrl
-        const dims = clipUrl ? resolutionCache[clipUrl] : null
-        const resInfo = getClipResolution(selectedClip)
+        const dims = getClipDimensions(selectedClip)
         const genParams = liveAsset?.generationParams
 
         // Current take info
@@ -125,7 +140,8 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
 
         // Determine if this is an upscaled take (take index > 0 and resolution is higher than original)
         const originalRes = liveAsset?.generationParams?.resolution
-        const isUpscaled = resInfo && originalRes ? resInfo.height > parseInt(originalRes) : false
+        const qualityTier = dims ? namedResolutionTier(Math.min(dims.width, dims.height)) : 0
+        const isUpscaled = dims && originalRes ? qualityTier > parseInt(originalRes, 10) : false
 
         return (
           <div className="space-y-3">
@@ -142,7 +158,7 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                         <button
                           onClick={() => {
                             if (confirm(`Delete take ${displayTakeNum}?`)) {
-                              handleDeleteTake(selectedClip.id)
+                              handleDeleteDisplayedTake()
                             }
                           }}
                           className="p-0.5 rounded hover:bg-red-900/50 text-zinc-500 hover:text-red-400 transition-colors"
@@ -153,23 +169,16 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                     )}
                   </div>
                 </div>
-                {resInfo ? (
+                {dims ? (
                   <>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-zinc-400">Resolution</span>
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: resInfo.color }} />
-                        <span className="text-xs font-semibold" style={{ color: resInfo.color }}>{resInfo.label}</span>
-                      </div>
-                    </div>
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-zinc-400">Quality</span>
                       <span className="text-xs text-white">
-                        {resInfo.height >= 2160 ? 'Ultra HD' : resInfo.height >= 1080 ? 'Full HD' : resInfo.height >= 720 ? 'HD' : 'SD'}
+                        {qualityTier >= 2160 ? 'Ultra HD' : qualityTier >= 1080 ? 'Full HD' : qualityTier >= 720 ? 'HD' : 'SD'}
                         {isUpscaled && <span className="ml-1.5 text-green-400">(Upscaled)</span>}
                       </span>
                     </div>
-                    {dims && dims.width > 0 && (
+                    {dims.width > 0 && (
                       <div className="flex items-center justify-between">
                         <span className="text-xs text-zinc-400">Dimensions</span>
                         <span className="text-xs text-white font-mono">{dims.width} × {dims.height}</span>
@@ -177,7 +186,7 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                     )}
                   </>
                 ) : (
-                  <div className="text-xs text-zinc-500 italic">Detecting resolution...</div>
+                  <div className="text-xs text-zinc-500 italic">Dimension metadata unavailable.</div>
                 )}
                 {originalRes && originalRes !== 'imported' && (
                   <div className="flex items-center justify-between">
@@ -198,6 +207,7 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                     {selectedClip.type === 'video' && <FileVideo className="h-3 w-3 text-zinc-400" />}
                     {selectedClip.type === 'image' && <FileImage className="h-3 w-3 text-zinc-400" />}
                     {selectedClip.type === 'audio' && <FileAudio className="h-3 w-3 text-zinc-400" />}
+                    {selectedClip.type === 'text' && <Type className="h-3 w-3 text-zinc-400" />}
                     <span className="text-xs text-white capitalize">{selectedClip.type}</span>
                   </div>
                 </div>
@@ -608,15 +618,11 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
         {/* Image-to-Video quick action for image clips */}
         {selectedClip.type === 'image' && (
           <button
-            onClick={() => {
-              setI2vClipId(selectedClip.id)
-              setI2vPrompt(selectedClip.asset?.prompt || '')
-            }}
-            disabled={isRegenerating && i2vClipId === selectedClip.id}
+            onClick={() => onCreateVideoFromImage(selectedClip)}
             className="w-full px-3 py-2 rounded-lg bg-blue-600/15 border border-blue-500/30 text-blue-400 text-xs hover:bg-blue-600/25 hover:border-blue-500/50 transition-colors font-medium flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Film className="h-3.5 w-3.5" />
-            {isRegenerating && i2vClipId === selectedClip.id ? 'Generating Video...' : 'Generate Video (I2V)'}
+            Generate Video (I2V)
           </button>
         )}
         <div>
@@ -658,239 +664,252 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
           </div>
         </div>
 
-        <div>
-          <label className="block text-xs text-zinc-500 mb-1">Speed</label>
-          <input
-            type="range"
-            min={0.25}
-            max={4}
-            step={0.25}
-            value={selectedClip.speed}
-            onChange={(e) => {
-              const newSpeed = parseFloat(e.target.value)
-              const oldSpeed = selectedClip.speed
-              let newDuration = selectedClip.duration * (oldSpeed / newSpeed)
-              const maxDur = getMaxClipDuration({ ...selectedClip, speed: newSpeed })
-              newDuration = Math.min(newDuration, maxDur)
-              newDuration = Math.max(0.5, newDuration)
-              updateClip(selectedClip.id, { speed: newSpeed, duration: newDuration })
-            }}
-            className="w-full"
-          />
-          <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
-            <span>0.25x</span>
-            <span className="text-white">{selectedClip.speed}x</span>
-            <span>4x</span>
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-xs text-zinc-500 mb-1">Volume</label>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.1}
-            value={selectedClip.muted ? 0 : selectedClip.volume}
-            onChange={(e) => updateClip(selectedClip.id, { volume: parseFloat(e.target.value), muted: false })}
-            className="w-full"
-          />
-          <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
-            <span>0%</span>
-            <span className="text-white">{selectedClip.muted ? '0' : Math.round(selectedClip.volume * 100)}%</span>
-            <span>100%</span>
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 cursor-pointer">
+        {hasPlaybackControls && (
+          <div>
+            <label className="block text-xs text-zinc-500 mb-1">Speed</label>
             <input
-              type="checkbox"
-              checked={selectedClip.reversed}
-              onChange={(e) => updateClip(selectedClip.id, { reversed: e.target.checked })}
-              className="rounded bg-zinc-800 border-zinc-600"
+              type="range"
+              min={0.25}
+              max={4}
+              step={0.25}
+              value={selectedClip.speed}
+              onChange={(e) => {
+                const newSpeed = parseFloat(e.target.value)
+                const oldSpeed = selectedClip.speed
+                let newDuration = selectedClip.duration * (oldSpeed / newSpeed)
+                const maxDur = getMaxClipDuration({ ...selectedClip, speed: newSpeed })
+                newDuration = Math.min(newDuration, maxDur)
+                newDuration = Math.max(0.5, newDuration)
+                updateClip(selectedClip.id, { speed: newSpeed, duration: newDuration })
+              }}
+              className="w-full"
             />
-            <span className="text-sm text-zinc-300">Reverse playback</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
+            <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
+              <span>0.25x</span>
+              <span className="text-white">{selectedClip.speed}x</span>
+              <span>4x</span>
+            </div>
+          </div>
+        )}
+
+        {hasAudioControls && (
+          <div>
+            <label className="block text-xs text-zinc-500 mb-1">Volume</label>
             <input
-              type="checkbox"
-              checked={selectedClip.muted}
-              onChange={(e) => updateClip(selectedClip.id, { muted: e.target.checked })}
-              className="rounded bg-zinc-800 border-zinc-600"
+              type="range"
+              min={0}
+              max={1}
+              step={0.1}
+              value={effectiveMuted ? 0 : effectiveVolume}
+              onChange={(e) => setClipAudioLevel(selectedClip.id, parseFloat(e.target.value))}
+              className="w-full"
             />
-            <span className="text-sm text-zinc-300">Mute audio</span>
-          </label>
-        </div>
+            <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
+              <span>0%</span>
+              <span className="text-white">{effectiveMuted ? '0' : Math.round(effectiveVolume * 100)}%</span>
+              <span>100%</span>
+            </div>
+          </div>
+        )}
+
+        {hasAudioControls && (
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={selectedClip.reversed}
+                onChange={(e) => updateClip(selectedClip.id, { reversed: e.target.checked })}
+                className="rounded bg-zinc-800 border-zinc-600"
+              />
+              <span className="text-sm text-zinc-300">Reverse playback</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={effectiveMuted}
+                onChange={(e) => setClipAudioMuted(selectedClip.id, e.target.checked)}
+                className="rounded bg-zinc-800 border-zinc-600"
+              />
+              <span className="text-sm text-zinc-300">Mute audio</span>
+            </label>
+          </div>
+        )}
 
         {/* --- Opacity --- */}
-        <div className="pt-3 border-t border-zinc-800">
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs font-semibold text-zinc-400">Opacity</label>
-            <span className="text-[10px] text-zinc-500 tabular-nums">{selectedClip.opacity ?? 100}%</span>
+        {!isTextClip && (
+          <div className="pt-3 border-t border-zinc-800">
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-semibold text-zinc-400">Opacity</label>
+              <span className="text-[10px] text-zinc-500 tabular-nums">{selectedClip.opacity ?? 100}%</span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={selectedClip.opacity ?? 100}
+              onChange={(e) => updateClip(selectedClip.id, { opacity: parseInt(e.target.value) })}
+              className="w-full h-1.5 accent-blue-500"
+            />
+            <div className="flex justify-between text-[9px] text-zinc-600 mt-0.5">
+              <span>0%</span>
+              <span>100%</span>
+            </div>
           </div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={1}
-            value={selectedClip.opacity ?? 100}
-            onChange={(e) => updateClip(selectedClip.id, { opacity: parseInt(e.target.value) })}
-            className="w-full h-1.5 accent-blue-500"
-          />
-          <div className="flex justify-between text-[9px] text-zinc-600 mt-0.5">
-            <span>0%</span>
-            <span>100%</span>
-          </div>
-        </div>
+        )}
 
         {/* --- Flip --- */}
-        <div className="pt-3 border-t border-zinc-800">
-          <button
-            className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
-            onClick={() => setShowFlip(!showFlip)}
-          >
-            {showFlip ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            <FlipHorizontal2 className="h-3.5 w-3.5" />
-            Flip
-          </button>
-          {showFlip && (
-            <div className="space-y-2 pl-5">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={selectedClip.flipH}
-                  onChange={(e) => updateClip(selectedClip.id, { flipH: e.target.checked })}
-                  className="rounded bg-zinc-800 border-zinc-600"
-                />
-                <FlipHorizontal2 className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-sm text-zinc-300">Horizontal</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={selectedClip.flipV}
-                  onChange={(e) => updateClip(selectedClip.id, { flipV: e.target.checked })}
-                  className="rounded bg-zinc-800 border-zinc-600"
-                />
-                <FlipVertical2 className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-sm text-zinc-300">Vertical</span>
-              </label>
-            </div>
-          )}
-        </div>
+        {hasVisualTransformControls && (
+          <div className="pt-3 border-t border-zinc-800">
+            <button
+              className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
+              onClick={() => setShowFlip(!showFlip)}
+            >
+              {showFlip ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              <FlipHorizontal2 className="h-3.5 w-3.5" />
+              Flip
+            </button>
+            {showFlip && (
+              <div className="space-y-2 pl-5">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedClip.flipH}
+                    onChange={(e) => updateClip(selectedClip.id, { flipH: e.target.checked })}
+                    className="rounded bg-zinc-800 border-zinc-600"
+                  />
+                  <FlipHorizontal2 className="h-3.5 w-3.5 text-zinc-400" />
+                  <span className="text-sm text-zinc-300">Horizontal</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedClip.flipV}
+                    onChange={(e) => updateClip(selectedClip.id, { flipV: e.target.checked })}
+                    className="rounded bg-zinc-800 border-zinc-600"
+                  />
+                  <FlipVertical2 className="h-3.5 w-3.5 text-zinc-400" />
+                  <span className="text-sm text-zinc-300">Vertical</span>
+                </label>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* --- Transitions --- */}
-        <div className="pt-3 border-t border-zinc-800">
-          <button
-            className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
-            onClick={() => setShowTransitions(!showTransitions)}
-          >
-            {showTransitions ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            <Film className="h-3.5 w-3.5" />
-            Transitions
-          </button>
-          {showTransitions && (
-            <div className="space-y-3 pl-5">
-              {/* Transition In */}
-              <div>
-                <label className="block text-[10px] text-zinc-500 mb-1 uppercase tracking-wider">Transition In</label>
-                <select
-                  value={selectedClip.transitionIn?.type || 'none'}
-                  onChange={(e) => updateClip(selectedClip.id, {
-                    transitionIn: { ...selectedClip.transitionIn, type: e.target.value as TransitionType }
-                  })}
-                  className="w-full px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-white text-xs"
-                >
-                  <option value="none">None</option>
-                  <option value="dissolve">Dissolve</option>
-                  <option value="fade-to-black">Fade from Black</option>
-                  <option value="fade-to-white">Fade from White</option>
-                  <option value="wipe-left">Wipe Left</option>
-                  <option value="wipe-right">Wipe Right</option>
-                  <option value="wipe-up">Wipe Up</option>
-                  <option value="wipe-down">Wipe Down</option>
-                </select>
-                {selectedClip.transitionIn?.type !== 'none' && (
-                  <div className="mt-1.5">
-                    <label className="block text-[10px] text-zinc-600 mb-0.5">Duration</label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="range"
-                        min={0.1}
-                        max={Math.min(2, selectedClip.duration / 2)}
-                        step={0.1}
-                        value={selectedClip.transitionIn?.duration || 0.5}
-                        onChange={(e) => updateClip(selectedClip.id, {
-                          transitionIn: { ...selectedClip.transitionIn, duration: parseFloat(e.target.value) }
-                        })}
-                        className="flex-1"
-                      />
-                      <span className="text-[10px] text-zinc-400 w-6 text-right">{(selectedClip.transitionIn?.duration || 0.5).toFixed(1)}s</span>
+        {hasTransitionControls && (
+          <div className="pt-3 border-t border-zinc-800">
+            <button
+              className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
+              onClick={() => setShowTransitions(!showTransitions)}
+            >
+              {showTransitions ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              <Film className="h-3.5 w-3.5" />
+              Transitions
+            </button>
+            {showTransitions && (
+              <div className="space-y-3 pl-5">
+                {/* Transition In */}
+                <div>
+                  <label className="block text-[10px] text-zinc-500 mb-1 uppercase tracking-wider">Transition In</label>
+                  <select
+                    value={selectedClip.transitionIn?.type || 'none'}
+                    onChange={(e) => updateClip(selectedClip.id, {
+                      transitionIn: { ...selectedClip.transitionIn, type: e.target.value as TransitionType }
+                    })}
+                    className="w-full px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-white text-xs"
+                  >
+                    <option value="none">None</option>
+                    <option value="dissolve">Dissolve</option>
+                    <option value="fade-to-black">Fade from Black</option>
+                    <option value="fade-to-white">Fade from White</option>
+                    <option value="wipe-left">Wipe Left</option>
+                    <option value="wipe-right">Wipe Right</option>
+                    <option value="wipe-up">Wipe Up</option>
+                    <option value="wipe-down">Wipe Down</option>
+                  </select>
+                  {selectedClip.transitionIn?.type !== 'none' && (
+                    <div className="mt-1.5">
+                      <label className="block text-[10px] text-zinc-600 mb-0.5">Duration</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={0.1}
+                          max={Math.min(2, selectedClip.duration / 2)}
+                          step={0.1}
+                          value={selectedClip.transitionIn?.duration || 0.5}
+                          onChange={(e) => updateClip(selectedClip.id, {
+                            transitionIn: { ...selectedClip.transitionIn, duration: parseFloat(e.target.value) }
+                          })}
+                          className="flex-1"
+                        />
+                        <span className="text-[10px] text-zinc-400 w-6 text-right">{(selectedClip.transitionIn?.duration || 0.5).toFixed(1)}s</span>
+                      </div>
                     </div>
-                  </div>
-                )}
-              </div>
-              {/* Transition Out */}
-              <div>
-                <label className="block text-[10px] text-zinc-500 mb-1 uppercase tracking-wider">Transition Out</label>
-                <select
-                  value={selectedClip.transitionOut?.type || 'none'}
-                  onChange={(e) => updateClip(selectedClip.id, {
-                    transitionOut: { ...selectedClip.transitionOut, type: e.target.value as TransitionType }
-                  })}
-                  className="w-full px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-white text-xs"
-                >
-                  <option value="none">None</option>
-                  <option value="dissolve">Dissolve</option>
-                  <option value="fade-to-black">Fade to Black</option>
-                  <option value="fade-to-white">Fade to White</option>
-                  <option value="wipe-left">Wipe Left</option>
-                  <option value="wipe-right">Wipe Right</option>
-                  <option value="wipe-up">Wipe Up</option>
-                  <option value="wipe-down">Wipe Down</option>
-                </select>
-                {selectedClip.transitionOut?.type !== 'none' && (
-                  <div className="mt-1.5">
-                    <label className="block text-[10px] text-zinc-600 mb-0.5">Duration</label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="range"
-                        min={0.1}
-                        max={Math.min(2, selectedClip.duration / 2)}
-                        step={0.1}
-                        value={selectedClip.transitionOut?.duration || 0.5}
-                        onChange={(e) => updateClip(selectedClip.id, {
-                          transitionOut: { ...selectedClip.transitionOut, duration: parseFloat(e.target.value) }
-                        })}
-                        className="flex-1"
-                      />
-                      <span className="text-[10px] text-zinc-400 w-6 text-right">{(selectedClip.transitionOut?.duration || 0.5).toFixed(1)}s</span>
+                  )}
+                </div>
+                {/* Transition Out */}
+                <div>
+                  <label className="block text-[10px] text-zinc-500 mb-1 uppercase tracking-wider">Transition Out</label>
+                  <select
+                    value={selectedClip.transitionOut?.type || 'none'}
+                    onChange={(e) => updateClip(selectedClip.id, {
+                      transitionOut: { ...selectedClip.transitionOut, type: e.target.value as TransitionType }
+                    })}
+                    className="w-full px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-white text-xs"
+                  >
+                    <option value="none">None</option>
+                    <option value="dissolve">Dissolve</option>
+                    <option value="fade-to-black">Fade to Black</option>
+                    <option value="fade-to-white">Fade to White</option>
+                    <option value="wipe-left">Wipe Left</option>
+                    <option value="wipe-right">Wipe Right</option>
+                    <option value="wipe-up">Wipe Up</option>
+                    <option value="wipe-down">Wipe Down</option>
+                  </select>
+                  {selectedClip.transitionOut?.type !== 'none' && (
+                    <div className="mt-1.5">
+                      <label className="block text-[10px] text-zinc-600 mb-0.5">Duration</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={0.1}
+                          max={Math.min(2, selectedClip.duration / 2)}
+                          step={0.1}
+                          value={selectedClip.transitionOut?.duration || 0.5}
+                          onChange={(e) => updateClip(selectedClip.id, {
+                            transitionOut: { ...selectedClip.transitionOut, duration: parseFloat(e.target.value) }
+                          })}
+                          className="flex-1"
+                        />
+                        <span className="text-[10px] text-zinc-400 w-6 text-right">{(selectedClip.transitionOut?.duration || 0.5).toFixed(1)}s</span>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {/* EFFECTS HIDDEN - Applied Effects section hidden because effects are not applied during export */}
 
         {/* --- Color Correction --- */}
-        <div className="pt-3 border-t border-zinc-800">
-          <button
-            className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
-            onClick={() => setShowColorCorrection(!showColorCorrection)}
-          >
-            {showColorCorrection ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            <Palette className="h-3.5 w-3.5" />
-            Color Correction
-            {selectedClip.colorCorrection && Object.values(selectedClip.colorCorrection).some(v => v !== 0) && (
-              <span className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0" />
-            )}
-          </button>
-          {showColorCorrection && (
-            <div className="space-y-2.5 pl-1">
+        {hasColorCorrectionControls && (
+          <div className="pt-3 border-t border-zinc-800">
+            <button
+              className="flex items-center gap-2 w-full text-left text-xs font-semibold text-zinc-400 hover:text-white transition-colors mb-2"
+              onClick={() => setShowColorCorrection(!showColorCorrection)}
+            >
+              {showColorCorrection ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              <Palette className="h-3.5 w-3.5" />
+              Color Correction
+              {selectedClip.colorCorrection && Object.values(selectedClip.colorCorrection).some(v => v !== 0) && (
+                <span className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0" />
+              )}
+            </button>
+            {showColorCorrection && (
+              <div className="space-y-2.5 pl-1">
               <button
                 className="flex items-center gap-1.5 text-[10px] text-zinc-500 hover:text-blue-400 transition-colors"
                 onClick={() => updateClip(selectedClip.id, { colorCorrection: { ...DEFAULT_COLOR_CORRECTION } })}
@@ -1074,9 +1093,10 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                   className="w-full h-1.5 accent-blue-500"
                 />
               </div>
-            </div>
-          )}
-        </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>}
     </div>
   )

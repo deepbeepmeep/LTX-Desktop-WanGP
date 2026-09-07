@@ -66,7 +66,7 @@ function getInstalledHashPath(): string {
 
 /** Directory where python-embed lives at runtime. */
 export function getPythonDir(): string {
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' || process.platform === 'linux') {
     if (isDev) {
       return path.join(process.cwd(), 'python-embed')
     }
@@ -81,7 +81,7 @@ export function getPythonDir(): string {
  * Also promotes a staged python-next/ directory if it matches the expected hash.
  */
 export function isPythonReady(): { ready: boolean } {
-  if (process.platform !== 'win32') {
+  if (process.platform === 'darwin') {
     return { ready: true }
   }
 
@@ -112,7 +112,7 @@ export function isPythonReady(): { ready: boolean } {
   const installedHash = readHash(getInstalledHashPath())
 
   if (!bundledHash) {
-    const pythonExe = path.join(getPythonDir(), 'python.exe')
+    const pythonExe = path.join(getPythonDir(), process.platform === 'win32' ? 'python.exe' : 'bin/python3')
     return { ready: fs.existsSync(pythonExe) }
   }
 
@@ -128,7 +128,7 @@ export async function preDownloadPythonForUpdate(
   newVersion: string,
   onProgress?: (progress: PythonSetupProgress) => void
 ): Promise<boolean> {
-  if (process.platform !== 'win32') {
+  if (process.platform === 'darwin') {
     return false
   }
 
@@ -136,25 +136,7 @@ export async function preDownloadPythonForUpdate(
     || `https://github.com/Lightricks/ltx-desktop/releases/download/v${newVersion}`
 
   // Fetch the new version's deps hash
-  let newHash: string | null = null
-  if (isLocalPath(baseUrl)) {
-    // Local testing: read hash from the directory or the archive's extracted deps-hash.txt
-    const hashFile = baseUrl.endsWith('.tar.gz')
-      ? null // Can't read hash from a single tar.gz without extracting
-      : path.join(baseUrl, 'deps-hash.txt')
-    newHash = hashFile ? readHash(hashFile) : null
-  } else {
-    const hashUrl = `${baseUrl}/python-deps-hash.txt`
-    const hashDest = path.join(app.getPath('userData'), 'python-next-hash-check.txt')
-    try {
-      await downloadFileRaw(hashUrl, hashDest)
-      newHash = readHash(hashDest)
-    } catch (err) {
-      logger.warn( `[python-setup] Could not fetch new version deps hash: ${err}`)
-    } finally {
-      try { fs.unlinkSync(hashDest) } catch { /* ignore */ }
-    }
-  }
+  const newHash = await fetchRemoteDepsHash(baseUrl, 'python-next-hash-check.txt')
 
   if (!newHash) {
     logger.info( '[python-setup] No deps hash available for new version, skipping pre-download')
@@ -190,7 +172,8 @@ export async function preDownloadPythonForUpdate(
     try {
       await acquireArchive(baseUrl, archivePath, cleanupFiles, progressCb)
     } catch (primaryErr) {
-      const fallbackUrl = newHash ? `${FALLBACK_CDN_BASE}/python-embed-win32/${newHash}/python-embed-win32.tar.gz` : null
+      const prefix = getPythonArchivePrefix()
+      const fallbackUrl = newHash ? `${FALLBACK_CDN_BASE}/${prefix}/${newHash}/${prefix}.tar.gz` : null
       if (!fallbackUrl || isLocalPath(baseUrl)) {
         throw primaryErr
       }
@@ -242,6 +225,16 @@ function readHash(filePath: string): string | null {
 
 const FALLBACK_CDN_BASE = 'https://storage.googleapis.com/ltx-desktop-artifacts'
 
+function getPythonArchivePrefix(): string {
+  if (process.platform === 'win32') return 'python-embed-win32'
+  if (process.platform === 'linux') {
+    if (process.arch === 'x64') return 'python-embed-linux-x64'
+    if (process.arch === 'arm64') return 'python-embed-linux-arm64'
+    throw new Error(`Unsupported Linux architecture: ${process.arch}`)
+  }
+  throw new Error(`Python download is not supported on ${process.platform}`)
+}
+
 function getArchiveBase(): string {
   // LTX_PYTHON_URL is a dev-only override for testing with local archives.
   // Disabled in production to prevent code injection into a signed app.
@@ -255,11 +248,34 @@ function getArchiveBase(): string {
 function getFallbackArchiveUrl(): string | null {
   const hash = readHash(getBundledHashPath())
   if (!hash) return null
-  return `${FALLBACK_CDN_BASE}/python-embed-win32/${hash}/python-embed-win32.tar.gz`
+  const prefix = getPythonArchivePrefix()
+  return `${FALLBACK_CDN_BASE}/${prefix}/${hash}/${prefix}.tar.gz`
 }
 
 function isLocalPath(source: string): boolean {
   return !source.startsWith('http://') && !source.startsWith('https://')
+}
+
+/**
+ * Fetch the deps-hash for a python-embed source (local dir/archive or remote base URL),
+ * without downloading the full archive. Returns null if unavailable.
+ */
+async function fetchRemoteDepsHash(base: string, tempFileName: string): Promise<string | null> {
+  if (isLocalPath(base)) {
+    if (base.endsWith('.tar.gz')) return null // can't inspect a single tar.gz without extracting
+    return readHash(path.join(base, 'deps-hash.txt'))
+  }
+  const hashUrl = `${base}/python-deps-hash.txt`
+  const hashDest = path.join(app.getPath('userData'), tempFileName)
+  try {
+    await downloadFileRaw(hashUrl, hashDest)
+    return readHash(hashDest)
+  } catch (err) {
+    logger.warn( `[python-setup] Could not fetch deps hash from ${hashUrl}: ${err}`)
+    return null
+  } finally {
+    try { fs.unlinkSync(hashDest) } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -314,7 +330,7 @@ export async function downloadPythonEmbed(
 ): Promise<void> {
   const destDir = path.join(app.getPath('userData'), 'python')
   const tempDir = path.join(app.getPath('userData'), 'python-tmp')
-  const archivePath = path.join(app.getPath('userData'), 'python-embed-win32.tar.gz')
+  const archivePath = path.join(app.getPath('userData'), `${getPythonArchivePrefix()}.tar.gz`)
 
   try {
     if (fs.existsSync(tempDir)) {
@@ -330,12 +346,42 @@ export async function downloadPythonEmbed(
     const base = getArchiveBase()
     logger.info( `[python-setup] Archive base: ${base}`)
 
+    // Verify the source's deps hash matches what this build expects before downloading
+    // the (multi-GB) archive. A version-tagged release can be stale relative to the
+    // currently bundled backend code (e.g. deps changed without a version bump), so a
+    // successful download from `base` is not by itself proof the content is correct.
+    const expectedHash = readHash(getBundledHashPath())
+    let source = base
+    if (expectedHash) {
+      const remoteHash = await fetchRemoteDepsHash(base, `${getPythonArchivePrefix()}-hash-check.txt`)
+      if (remoteHash === null && isLocalPath(base)) {
+        // A local archive (dev/testing) has no sidecar hash to fetch, so the check is
+        // unverifiable rather than mismatched — skip it instead of hard-failing, which
+        // otherwise makes a valid local python-embed.tar.gz unusable whenever a bundled
+        // hash is present.
+        logger.warn(`[python-setup] Local archive at ${base}: no remote deps hash to verify, skipping check`)
+      } else if (remoteHash !== expectedHash) {
+        const fallbackUrl = getFallbackArchiveUrl()
+        if (!fallbackUrl || isLocalPath(base)) {
+          throw new Error(
+            `Python deps hash mismatch at ${base} (expected ${expectedHash}, got ${remoteHash ?? 'unknown'}) and no CDN fallback available`
+          )
+        }
+        logger.warn(
+          `[python-setup] Archive at ${base} has deps hash ${remoteHash ?? 'unknown'}, expected ${expectedHash} — using hash-addressed CDN instead`
+        )
+        source = fallbackUrl
+      }
+    } else {
+      logger.warn( '[python-setup] No bundled deps hash found, skipping archive verification')
+    }
+
     try {
-      await acquireArchive(base, archivePath, cleanupFiles, onProgress)
+      await acquireArchive(source, archivePath, cleanupFiles, onProgress)
     } catch (primaryErr) {
       // Primary source failed — try CDN fallback
       const fallbackUrl = getFallbackArchiveUrl()
-      if (!fallbackUrl || isLocalPath(base)) {
+      if (!fallbackUrl || isLocalPath(source) || source === fallbackUrl) {
         throw primaryErr
       }
 
@@ -395,7 +441,7 @@ async function acquirePartsLocal(
   cleanupFiles: string[],
   onProgress: (progress: PythonSetupProgress) => void
 ): Promise<void> {
-  const manifestPath = path.join(dirPath, 'python-embed-win32.manifest.json')
+  const manifestPath = path.join(dirPath, `${getPythonArchivePrefix()}.manifest.json`)
   const manifest: ArchiveManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'))
 
   const partPaths: string[] = []
@@ -423,8 +469,9 @@ async function acquirePartsRemote(
   onProgress: (progress: PythonSetupProgress) => void
 ): Promise<void> {
   // Fetch manifest
-  const manifestUrl = `${baseUrl}/python-embed-win32.manifest.json`
-  const manifestDest = path.join(app.getPath('userData'), 'python-embed-win32.manifest.json')
+  const prefix = getPythonArchivePrefix()
+  const manifestUrl = `${baseUrl}/${prefix}.manifest.json`
+  const manifestDest = path.join(app.getPath('userData'), `${prefix}.manifest.json`)
   cleanupFiles.push(manifestDest)
   await downloadFileRaw(manifestUrl, manifestDest)
   const manifest: ArchiveManifest = JSON.parse(fs.readFileSync(manifestDest, 'utf-8'))

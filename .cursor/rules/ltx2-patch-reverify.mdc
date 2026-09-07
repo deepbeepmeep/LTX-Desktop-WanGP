@@ -1,0 +1,19 @@
+---
+description: Re-verify Desktop monkey-patches when bumping ltx-core or ltx-pipelines
+globs: backend/pyproject.toml
+alwaysApply: false
+---
+
+# LTX-2 bump → re-check `services.patches`
+
+If this change updates `ltx-core` or `ltx-pipelines` (version pin, git tag, or `tool.uv.dependency-metadata`), treat every module imported from `backend/services/patches/` in `backend/ltx2_server.py` as suspect.
+
+Those patches rebind private upstream symbols. A bump can rename the target (import-time assert should fail) or change the contract (assert still passes, behavior is wrong).
+
+For each patch:
+
+1. Read the module's "Remove once ..." docstring. If upstream now includes the fix, delete the patch and its `ltx2_server.py` import.
+2. Otherwise diff the upstream function against the replacement and keep the contract identical.
+3. Run that patch's tests (`backend/tests/test_<patch>.py`).
+
+`safetensors_metadata_fix` is in this set (Windows 1455 / LTX-Desktop#158: do not `safe_open` the 46GB distilled-1.1 checkpoint in `_read_scales` or `_scan_checkpoint_keys`).

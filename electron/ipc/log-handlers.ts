@@ -1,23 +1,26 @@
-import { ipcMain } from 'electron'
 import fs from 'fs'
 import { getLogDir, getCurrentLogFilename } from '../logging-management'
 import { logger, writeLog } from '../logger'
+import { handle } from './typed-handle'
 
 const VALID_LOG_LEVELS = new Set(['INFO', 'WARNING', 'ERROR', 'DEBUG'])
 
 export function registerLogHandlers(): void {
-  ipcMain.handle('write-log', async (_event, level: string, message: string) => {
+  handle('writeLog', ({ level, message }) => {
     const upperLevel = String(level).toUpperCase()
     if (!VALID_LOG_LEVELS.has(upperLevel)) return
     writeLog(upperLevel as 'INFO' | 'WARNING' | 'ERROR' | 'DEBUG', 'Renderer', String(message))
   })
-  ipcMain.handle('get-logs', async () => {
+
+  handle('getLogs', ({ query }) => {
     try {
       const logPath = getCurrentLogFilename()
       if (fs.existsSync(logPath)) {
         const content = fs.readFileSync(logPath, 'utf-8')
-        const allLines = content.split('\n')
-        const lines = allLines.slice(-200).map(l => l.trimEnd())
+        const allLines = content.split('\n').map(l => l.trimEnd())
+        // A search needs the whole session to find matches, not just the
+        // recent tail we show by default -- skip the truncation while searching.
+        const lines = query ? allLines : allLines.slice(-200)
         return { logPath, lines }
       }
       return { logPath, lines: [] }
@@ -27,13 +30,13 @@ export function registerLogHandlers(): void {
     }
   })
 
-  ipcMain.handle('get-log-path', async () => {
+  handle('getLogPath', () => {
     const logPath = getCurrentLogFilename()
     const logDir = getLogDir()
     return { logPath, logDir }
   })
 
-  ipcMain.handle('open-log-folder', async () => {
+  handle('openLogFolder', async () => {
     const logDir = getLogDir()
     if (fs.existsSync(logDir)) {
       const { shell } = await import('electron')

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from state.app_state_types import FileDownloadRunning, GpuSlot, VideoPipelineState, VideoPipelineWarmth
+from state.app_state_types import DownloadingSession, FileDownloadRunning, GpuSlot, VideoPipelineState
 from tests.fakes.services import FakeFastVideoPipeline
 
 
@@ -12,10 +12,9 @@ class TestGenerationProgressCamelCaseKeys:
         test_state.state.gpu_slot = GpuSlot(
             active_pipeline=VideoPipelineState(
                 pipeline=pipeline,
-                warmth=VideoPipelineWarmth.COLD,
                 is_compiled=False,
+                ltx_model_id="ltx-2.5-22b-distilled",
             ),
-            generation=None,
         )
         test_state.generation.start_generation("gen-1")
         test_state.generation.update_progress("inference", 50, 5, 20)
@@ -31,33 +30,36 @@ class TestGenerationProgressCamelCaseKeys:
         assert data["totalSteps"] == 20
 
 
-class TestDownloadProgressCamelCaseKeys:
-    def test_camelcase_keys(self, client, test_state):
-        test_state.state.downloading_session = {
-            "checkpoint": FileDownloadRunning(
-                target_path="checkpoint",
-                progress=0.45,
+class TestDownloadProgressSnakeCaseKeys:
+    def test_snake_case_keys(self, client, test_state):
+        test_state.state.downloading_session = DownloadingSession(
+            id="test-session",
+            current_running_file=FileDownloadRunning(
+                file_type="ltx-2.3-22b-distilled",
+                target_path="ltx-2.3-22b-distilled.safetensors",
                 downloaded_bytes=5_000_000_000,
-                total_bytes=19_000_000_000,
-                speed_mbps=50,
-            )
-        }
+                speed_bytes_per_sec=50_000_000.0,
+            ),
+            files_to_download={"ltx-2.3-22b-distilled"},
+            completed_files=set(),
+            completed_bytes=0,
+        )
 
-        r = client.get("/api/models/download/progress")
+        r = client.get("/api/models/download/progress", params={"sessionId": "test-session"})
         assert r.status_code == 200
         data = r.json()
 
         expected_keys = {
             "status",
-            "currentFile",
-            "currentFileProgress",
-            "totalProgress",
-            "downloadedBytes",
-            "totalBytes",
-            "filesCompleted",
-            "totalFiles",
+            "current_downloading_file",
+            "current_file_progress",
+            "total_progress",
+            "total_downloaded_bytes",
+            "expected_total_bytes",
+            "completed_files",
+            "all_files",
             "error",
-            "speedMbps",
+            "speed_bytes_per_sec",
         }
         assert set(data.keys()) == expected_keys
 
@@ -70,11 +72,13 @@ class TestSettingsCamelCaseKeys:
 
         assert "useTorchCompile" in data
         assert "use_torch_compile" not in data
-        assert "fastModel" in data
-        assert "fast_model" not in data
         assert "seedLocked" in data
         assert "seed_locked" not in data
         assert "hasFalApiKey" in data
+        assert "fastModel" not in data
+        assert "fast_model" not in data
+        assert "proModel" not in data
+        assert "pro_model" not in data
 
 
 class TestGenerateSnakeCaseKeys:

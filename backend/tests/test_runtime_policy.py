@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 def test_runtime_policy_true(client, test_state):
-    test_state.config.force_api_generations = True
+    test_state.config.local_generations_mode = "unsupported"
 
     response = client.get("/api/runtime-policy")
     assert response.status_code == 200
@@ -12,7 +12,7 @@ def test_runtime_policy_true(client, test_state):
 
 
 def test_runtime_policy_false(client, test_state):
-    test_state.config.force_api_generations = False
+    test_state.config.local_generations_mode = "full_models_loading"
 
     response = client.get("/api/runtime-policy")
     assert response.status_code == 200

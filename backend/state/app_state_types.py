@@ -3,61 +3,86 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, NewType, Protocol
+
+from api_types import LTXLocalModelId, ModelCheckpointID
+from state.conditioning_cache import ConditioningCache
 
 if TYPE_CHECKING:
     from state.app_settings import AppSettings
     from services.interfaces import (
         A2VPipeline,
+        DepthProcessorPipeline,
         FastVideoPipeline,
         ImageGenerationPipeline,
         IcLoraPipeline,
+        PoseProcessorPipeline,
         RetakePipeline,
         TextEncoder,
     )
     import torch
 
 
-# ============================================================
-# Model file availability (disk truth)
-# ============================================================
-
-ModelFileType = Literal["checkpoint", "upsampler", "text_encoder", "zit"]
-
-# Availability and download are orthogonal concerns.
-AvailableFiles = dict[ModelFileType, Path | None]
-
-
-# ============================================================
 # Download session
 # ============================================================
 
 
+DownloadSessionId = NewType("DownloadSessionId", str)
+
+
+@dataclass(frozen=True)
+class DownloadSessionComplete:
+    status: str = "complete"
+
+
+@dataclass(frozen=True)
+class DownloadSessionError:
+    error_message: str
+    status: str = "error"
+
+
+DownloadSessionResult = DownloadSessionComplete | DownloadSessionError
+
+
+def _default_completed_download_sessions() -> dict[DownloadSessionId, DownloadSessionResult]:
+    return {}
+
+
 @dataclass
 class FileDownloadRunning:
+    file_type: ModelCheckpointID
     target_path: str
-    progress: float
     downloaded_bytes: int
-    total_bytes: int
-    speed_mbps: float
+    speed_bytes_per_sec: float
 
 
 @dataclass
-class FileDownloadCompleted:
-    pass
+class DownloadingSession:
+    id: DownloadSessionId
+    current_running_file: FileDownloadRunning | None
+    files_to_download: set[ModelCheckpointID]
+    completed_files: set[ModelCheckpointID]
+    completed_bytes: int
 
 
-FileDownloadState = FileDownloadRunning | FileDownloadCompleted
-
-
+# One shape for both catalog download kinds (IC-LoRA + plain LoRA). The kinds keep separate
+# state slots below so an IC-LoRA download never collides with a plain-LoRA one; `item_id` is
+# the catalog id of whichever kind owns the slot.
 @dataclass
-class DownloadError:
-    error: str
+class CatalogDownloadSession:
+    id: DownloadSessionId
+    item_id: str
+    downloaded_bytes: int
+    expected_bytes: int
+    speed_bytes_per_sec: float = 0.0
 
 
-DownloadingSession = None | dict[ModelFileType, FileDownloadState] | DownloadError
+def _default_completed_ic_lora_download_sessions() -> dict[DownloadSessionId, DownloadSessionResult]:
+    return {}
+
+
+def _default_completed_lora_download_sessions() -> dict[DownloadSessionId, DownloadSessionResult]:
+    return {}
 
 
 # ============================================================
@@ -93,28 +118,51 @@ class TextEncoderState:
 # ============================================================
 
 
-class VideoPipelineWarmth(Enum):
-    COLD = "cold"
-    WARMING = "warming"
-    WARM = "warm"
-
-
 @dataclass
 class VideoPipelineState:
     pipeline: FastVideoPipeline
-    warmth: VideoPipelineWarmth
     is_compiled: bool
+    # Cache key: API text-encode mode leaves gemma_root=None across versions, so without this a
+    # switch (2.5 <-> 2.3) wouldn't rebuild.
+    ltx_model_id: LTXLocalModelId
+    loras: tuple[tuple[str, float], ...] = field(default_factory=tuple)
+    # gemma_root the pipeline's text encoder was built with. Part of the cache key: switching
+    # text-encoding mode (API<->local) changes it, and a cached pipeline built for the other
+    # mode must be rebuilt (an API-mode pipeline has a stub encoder that can't encode locally).
+    gemma_root: str | None = None
+    # Video VAE file the pipeline was built with. Fast decode swaps this path; a cached
+    # pipeline loaded for the other decoder must be rebuilt.
+    video_vae_path: str | None = None
+
+
+@dataclass
+class PoseResources:
+    pipeline: PoseProcessorPipeline
+    person_detector_model_path: str
+    pose_model_path: str
 
 
 @dataclass
 class ICLoraState:
     pipeline: IcLoraPipeline
     lora_path: str
+    depth_pipeline: DepthProcessorPipeline | None
+    depth_model_path: str | None
+    ltx_model_id: LTXLocalModelId  # cache key — see VideoPipelineState.ltx_model_id
+    lora_strength: float = 1.0
+    pose_resources: PoseResources | None = None
+    conditioning_cache: ConditioningCache = field(default_factory=ConditioningCache)
+    gemma_root: str | None = None  # cache key — see VideoPipelineState.gemma_root
+    video_vae_path: str | None = None  # cache key — see VideoPipelineState.video_vae_path
 
 
 @dataclass
 class A2VPipelineState:
     pipeline: A2VPipeline
+    ltx_model_id: LTXLocalModelId  # cache key — see VideoPipelineState.ltx_model_id
+    loras: tuple[tuple[str, float], ...] = field(default_factory=tuple)
+    gemma_root: str | None = None  # cache key — see VideoPipelineState.gemma_root
+    video_vae_path: str | None = None  # cache key — see VideoPipelineState.video_vae_path
 
 
 @dataclass
@@ -122,6 +170,9 @@ class RetakePipelineState:
     pipeline: RetakePipeline
     distilled: bool
     quantized: bool
+    ltx_model_id: LTXLocalModelId  # cache key — see VideoPipelineState.ltx_model_id
+    gemma_root: str | None = None  # cache key — see VideoPipelineState.gemma_root
+    video_vae_path: str | None = None  # cache key — see VideoPipelineState.video_vae_path
 
 
 # ============================================================
@@ -132,7 +183,7 @@ class RetakePipelineState:
 @dataclass
 class GenerationProgress:
     phase: str
-    progress: float
+    progress: int
     current_step: int | None
     total_steps: int | None
 
@@ -146,7 +197,9 @@ class GenerationRunning:
 @dataclass
 class GenerationComplete:
     id: str
-    result: str | list[str]
+    # None = completed successfully but produced no locally-recoverable artifact
+    # (e.g. an API retake that returned a remote payload instead of video bytes).
+    result: str | list[str] | None
 
 
 @dataclass
@@ -163,6 +216,19 @@ class GenerationCancelled:
 GenerationState = GenerationRunning | GenerationComplete | GenerationError | GenerationCancelled
 
 
+@dataclass
+class GpuGeneration:
+    state: GenerationState
+
+
+@dataclass
+class ApiGeneration:
+    state: GenerationState
+
+
+ActiveGeneration = GpuGeneration | ApiGeneration
+
+
 # ============================================================
 # Device slots
 # ============================================================
@@ -171,7 +237,6 @@ GenerationState = GenerationRunning | GenerationComplete | GenerationError | Gen
 @dataclass
 class GpuSlot:
     active_pipeline: VideoPipelineState | ICLoraState | A2VPipelineState | RetakePipelineState | ImageGenerationPipeline
-    generation: GenerationState | None
 
 
 @dataclass
@@ -179,34 +244,29 @@ class CpuSlot:
     active_pipeline: ImageGenerationPipeline
 
 
+# HuggingFace auth
 # ============================================================
-# Startup lifecycle
-# ============================================================
-
-# Internal warmup lifecycle markers consumed by AppHandler.default_warmup().
-
-@dataclass
-class StartupPending:
-    message: str
 
 
-@dataclass
-class StartupLoading:
-    current_step: str
-    progress: float
-
-
-@dataclass
-class StartupReady:
+@dataclass(frozen=True)
+class HfNotAuthenticated:
     pass
 
 
-@dataclass
-class StartupError:
-    error: str
+@dataclass(frozen=True)
+class HfOAuthPending:
+    state: str
+    code_verifier: str
+    created_at: float
 
 
-StartupState = StartupPending | StartupLoading | StartupReady | StartupError
+@dataclass(frozen=True)
+class HfAuthenticated:
+    access_token: str
+    expires_at: float
+
+
+HfAuthState = HfNotAuthenticated | HfOAuthPending | HfAuthenticated
 
 
 # ============================================================
@@ -216,19 +276,38 @@ StartupState = StartupPending | StartupLoading | StartupReady | StartupError
 
 @dataclass
 class AppState:
-    available_files: AvailableFiles
-    downloading_session: DownloadingSession
+    downloading_session: DownloadingSession | None
     gpu_slot: GpuSlot | None
-    api_generation: GenerationState | None
+    active_generation: ActiveGeneration | None
     cpu_slot: CpuSlot | None
     text_encoder: TextEncoderState | None
-    startup: StartupState
     app_settings: AppSettings
-
-    @property
-    def is_downloading(self) -> bool:
-        match self.downloading_session:
-            case dict() as files:
-                return any(isinstance(download_state, FileDownloadRunning) for download_state in files.values())
-            case _:
-                return False
+    completed_download_sessions: dict[DownloadSessionId, DownloadSessionResult] = field(
+        default_factory=_default_completed_download_sessions
+    )
+    hf_auth_state: HfAuthState = field(default_factory=HfNotAuthenticated)
+    ic_lora_download_session: CatalogDownloadSession | None = None
+    completed_ic_lora_download_sessions: dict[DownloadSessionId, DownloadSessionResult] = field(
+        default_factory=_default_completed_ic_lora_download_sessions
+    )
+    lora_download_session: CatalogDownloadSession | None = None
+    completed_lora_download_sessions: dict[DownloadSessionId, DownloadSessionResult] = field(
+        default_factory=_default_completed_lora_download_sessions
+    )
+    # Timestamp (time.monotonic()) of when a generation request passed its "not already running"
+    # check, before it does any slow pre-work (pipeline load — can take tens of seconds, worse
+    # for image models loading checkpoint shards) and long before active_generation reflects it
+    # as GenerationRunning. Without this, a second concurrent request's own "not already running"
+    # check would also pass during that window, letting two generations race to load pipelines
+    # and start concurrently — whichever loses the start_generation() race gets an error that
+    # (via fail_generation) can overwrite the WINNER's still-legitimately-running state.
+    # A timestamp (not a bool) so try_reserve_generation_start() can self-expire it — a request
+    # that raises on some validation path before ever reaching start_generation()/
+    # fail_generation() (both of which clear it) must not block every future generation forever.
+    generation_starting_since: float | None = None
+    # True for the whole reserved_generation_start() body, including after start_generation()
+    # clears generation_starting_since and after cancel flips GenerationRunning → Cancelled.
+    # Without this, Stop during text-encoder/transformer build frees the slot while
+    # pipeline.generate() is still on the GPU; the next Start double-loads weights
+    # (meta vs cuda:0).
+    generation_in_flight: bool = False

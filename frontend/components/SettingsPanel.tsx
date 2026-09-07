@@ -1,25 +1,41 @@
+import { useEffect, useMemo } from 'react'
 import { Select } from './ui/select'
-import type { GenerationMode } from './ModeTabs'
+import { videoGenerationResolutionLabel } from '../lib/video-resolution'
 import {
-  FORCED_API_VIDEO_FPS,
-  FORCED_API_VIDEO_RESOLUTIONS,
-  getAllowedForcedApiDurations,
-  sanitizeForcedApiVideoSettings,
-} from '../lib/api-video-options'
+  areVideoGenerationSettingsEquivalent,
+  resolveVideoGenerationOptions,
+  sanitizeVideoGenerationSettings,
+  type VideoGenerationModelSpecItem,
+  type VideoGenerationPipeline,
+} from '../lib/video-generation-model-specs'
+
+export type GenerationMode = 'text-to-video' | 'image-to-video' | 'text-to-image'
+
+export interface LoraSelection {
+  ref: string
+  name: string
+  scale: number
+  // Catalog id (e.g. "cozy-felt-style"), when this LoRA was picked from the library —
+  // absent for a manually-added/custom LoRA not in the catalog. Lets the prompt enhancer
+  // look up trigger/instructions without re-matching on filename or display name.
+  catalogId?: string
+}
 
 export interface GenerationSettings {
-  model: 'fast' | 'pro'
-  duration: number
+  model: VideoGenerationPipeline
+  duration: number | null
   videoResolution: string
   fps: number
   audio: boolean
   cameraMotion: string
   aspectRatio?: string
+  loras?: LoraSelection[]
   // Image-specific settings
   imageResolution: string
   imageAspectRatio: string
   imageSteps: number
   variations?: number  // Number of image variations to generate
+  imageEditStrength?: number  // Denoising strength when editing an existing image
 }
 
 interface SettingsPanelProps {
@@ -27,8 +43,11 @@ interface SettingsPanelProps {
   onSettingsChange: (settings: GenerationSettings) => void
   disabled?: boolean
   mode?: GenerationMode
-  forceApiGenerations?: boolean
   hasAudio?: boolean
+  videoModelSpecs?: VideoGenerationModelSpecItem[] | null
+  minimumDuration?: number
+  hideDuration?: boolean
+  videoSettingsMessage?: string | null
 }
 
 export function SettingsPanel({
@@ -36,38 +55,54 @@ export function SettingsPanel({
   onSettingsChange,
   disabled,
   mode = 'text-to-video',
-  forceApiGenerations = false,
   hasAudio = false,
+  videoModelSpecs,
+  minimumDuration,
+  hideDuration = false,
+  videoSettingsMessage,
 }: SettingsPanelProps) {
   const isImageMode = mode === 'text-to-image'
-  const LOCAL_MAX_DURATION: Record<string, number> = { '540p': 20, '720p': 10, '1080p': 5 }
+  const resolvedVideoOptions = useMemo(() => {
+    if (isImageMode || !videoModelSpecs || videoModelSpecs.length === 0) return null
+    return resolveVideoGenerationOptions({
+      settings,
+      modelSpecs: videoModelSpecs,
+      hasAudio,
+      minimumDuration,
+      durationSelection: hideDuration ? 'smallest_valid' : 'preserve',
+    })
+  }, [hasAudio, hideDuration, isImageMode, minimumDuration, settings, videoModelSpecs])
 
-  const handleChange = (key: keyof GenerationSettings, value: string | number | boolean) => {
-    const nextSettings = { ...settings, [key]: value } as GenerationSettings
-    if (forceApiGenerations && !isImageMode) {
-      onSettingsChange(sanitizeForcedApiVideoSettings(nextSettings, { hasAudio }))
+  useEffect(() => {
+    if (isImageMode || !videoModelSpecs || videoModelSpecs.length === 0) return
+    const sanitized = sanitizeVideoGenerationSettings(settings, videoModelSpecs, {
+      hasAudio,
+      minimumDuration,
+      durationSelection: hideDuration ? 'smallest_valid' : 'preserve',
+    })
+    if (!sanitized) return
+    if (!areVideoGenerationSettingsEquivalent(settings, sanitized)) {
+      onSettingsChange(sanitized)
+    }
+  }, [hasAudio, hideDuration, isImageMode, minimumDuration, onSettingsChange, settings, videoModelSpecs])
+
+  const handleChange = (key: keyof GenerationSettings, value: string | number | boolean | null) => {
+    if (isImageMode) {
+      onSettingsChange({ ...settings, [key]: value } as GenerationSettings)
       return
     }
+    if (!videoModelSpecs || videoModelSpecs.length === 0) return
 
-    // Clamp duration when resolution changes for local generation
-    if (key === 'videoResolution' && !forceApiGenerations) {
-      const maxDur = LOCAL_MAX_DURATION[value as string] ?? 20
-      if (nextSettings.duration > maxDur) {
-        nextSettings.duration = maxDur
-      }
+    const nextSettings = { ...settings, [key]: value } as GenerationSettings
+    const sanitized = sanitizeVideoGenerationSettings(nextSettings, videoModelSpecs, {
+      hasAudio,
+      minimumDuration,
+      durationSelection: hideDuration ? 'smallest_valid' : 'preserve',
+    })
+    if (sanitized) {
+      onSettingsChange(sanitized)
     }
-
-    onSettingsChange(nextSettings)
   }
-
-  const localMaxDuration = LOCAL_MAX_DURATION[settings.videoResolution] ?? 20
-  const durationOptions = forceApiGenerations
-    ? [...getAllowedForcedApiDurations(settings.model, settings.videoResolution, settings.fps)]
-    : [5, 6, 8, 10, 20].filter(d => d <= localMaxDuration)
-  const resolutionOptions = forceApiGenerations
-    ? (hasAudio ? ['1080p'] : [...FORCED_API_VIDEO_RESOLUTIONS])
-    : ['1080p', '720p', '540p']
-  const fpsOptions = forceApiGenerations ? [...FORCED_API_VIDEO_FPS] : [24, 25, 50]
 
   // Image mode settings
   if (isImageMode) {
@@ -104,71 +139,86 @@ export function SettingsPanel({
     )
   }
 
+  if (!videoModelSpecs || videoModelSpecs.length === 0 || !resolvedVideoOptions || !resolvedVideoOptions.hasCompatibleOptions) {
+    return (
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-xs text-zinc-500">
+        {videoSettingsMessage || 'Loading generation settings...'}
+      </div>
+    )
+  }
+
+  const showFps = resolvedVideoOptions.fpsOptions.length > 1
+  const videoControlsColumns = hideDuration
+    ? (showFps ? 'grid-cols-2' : 'grid-cols-1')
+    : (showFps ? 'grid-cols-3' : 'grid-cols-2')
+
   // Video mode settings
   return (
     <div className="space-y-4">
-      {/* Model Selection */}
-      {!forceApiGenerations ? (
-        <Select
-          label="Model"
-          value={settings.model}
-          onChange={(e) => handleChange('model', e.target.value)}
-          disabled={disabled}
-        >
-          <option value="fast">LTX 2.3 Fast</option>
-        </Select>
-      ) : (
-        <Select
-          label="Model"
-          value={settings.model}
-          onChange={(e) => handleChange('model', e.target.value)}
-          disabled={disabled}
-        >
-          <option value="fast" disabled={hasAudio}>LTX-2.3 Fast (API)</option>
-          <option value="pro">LTX-2.3 Pro (API)</option>
-        </Select>
-      )}
+      <Select
+        label="Model"
+        value={resolvedVideoOptions.selectedModel ?? settings.model}
+        onChange={(e) => handleChange('model', e.target.value)}
+        disabled={disabled}
+      >
+        {resolvedVideoOptions.modelOptions.map((item) => (
+          <option key={item.pipeline} value={item.pipeline}>
+            {item.spec.display_name}
+          </option>
+        ))}
+      </Select>
 
       {/* Duration, Resolution, FPS Row */}
-      <div className="grid grid-cols-3 gap-3">
-        <Select
-          label="Duration"
-          value={settings.duration}
-          onChange={(e) => handleChange('duration', parseInt(e.target.value))}
-          disabled={disabled}
-        >
-          {durationOptions.map((duration) => (
-            <option key={duration} value={duration}>
-              {duration} sec
-            </option>
-          ))}
-        </Select>
+      <div className={`grid gap-3 ${videoControlsColumns}`}>
+        {!hideDuration && (
+          <Select
+            label="Duration"
+            value={
+              resolvedVideoOptions.autoDurationAvailable && resolvedVideoOptions.selectedDuration === null
+                ? 'auto'
+                : String(resolvedVideoOptions.selectedDuration ?? settings.duration)
+            }
+            onChange={(e) => handleChange('duration', e.target.value === 'auto' ? null : parseInt(e.target.value))}
+            disabled={disabled}
+          >
+            {resolvedVideoOptions.autoDurationAvailable && (
+              <option value="auto">Auto</option>
+            )}
+            {resolvedVideoOptions.durationOptions.map((duration) => (
+              <option key={duration} value={duration}>
+                {duration} sec
+              </option>
+            ))}
+          </Select>
+        )}
 
         <Select
           label="Resolution"
-          value={settings.videoResolution}
+          value={resolvedVideoOptions.selectedResolution ?? settings.videoResolution}
           onChange={(e) => handleChange('videoResolution', e.target.value)}
           disabled={disabled}
         >
-          {resolutionOptions.map((resolution) => (
+          {resolvedVideoOptions.resolutionOptions.map((resolution) => (
             <option key={resolution} value={resolution}>
-              {resolution}
+              {videoGenerationResolutionLabel(resolution)}
             </option>
           ))}
         </Select>
 
-        <Select
-          label="FPS"
-          value={settings.fps}
-          onChange={(e) => handleChange('fps', parseInt(e.target.value))}
-          disabled={disabled}
-        >
-          {fpsOptions.map((fps) => (
-            <option key={fps} value={fps}>
-              {fps}
-            </option>
-          ))}
-        </Select>
+        {showFps && (
+          <Select
+            label="FPS"
+            value={resolvedVideoOptions.selectedFps ?? settings.fps}
+            onChange={(e) => handleChange('fps', parseInt(e.target.value))}
+            disabled={disabled}
+          >
+            {resolvedVideoOptions.fpsOptions.map((fps) => (
+              <option key={fps} value={fps}>
+                {fps}
+              </option>
+            ))}
+          </Select>
+        )}
       </div>
 
       {/* Aspect Ratio */}
@@ -178,14 +228,8 @@ export function SettingsPanel({
         onChange={(e) => handleChange('aspectRatio', e.target.value)}
         disabled={disabled}
       >
-        {hasAudio ? (
-          <option value="16:9">16:9 Landscape</option>
-        ) : (
-          <>
-            <option value="16:9">16:9 Landscape</option>
-            <option value="9:16">9:16 Portrait</option>
-          </>
-        )}
+        <option value="16:9">16:9 Landscape</option>
+        <option value="9:16">9:16 Portrait</option>
       </Select>
 
       {/* Audio and Camera Motion Row */}

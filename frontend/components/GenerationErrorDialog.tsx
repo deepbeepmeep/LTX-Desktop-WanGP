@@ -1,13 +1,18 @@
 import { useState } from 'react'
 import { AlertCircle, ChevronDown, ChevronRight, X } from 'lucide-react'
+import type { GenerationError } from '../lib/generation-errors'
 
 interface GenerationErrorDialogProps {
-  error: string
+  error: GenerationError
   onDismiss: () => void
 }
 
-function getHumanMessage(error: string): string {
-  const lower = error.toLowerCase()
+function assertNever(value: never): never {
+  throw new Error(`Unexpected generation error variant: ${JSON.stringify(value)}`)
+}
+
+function getGenericHumanMessage(message: string): string {
+  const lower = message.toLowerCase()
   if (lower.includes('409') || lower.includes('already')) {
     return 'A generation is already in progress. Please wait for it to finish or cancel it.'
   }
@@ -24,18 +29,54 @@ function getHumanMessage(error: string): string {
     return 'Failed to prepare the input image. The file may be corrupted or inaccessible.'
   }
   if (lower.includes('could not auto-generate') || lower.includes('send to genspace')) {
-    return error
+    return message
   }
   return 'Something went wrong during generation. Please try again.'
 }
 
+function getDialogModel(error: GenerationError): {
+  humanMessage: string
+  technicalDetails: string
+  primaryAction?: {
+    label: string
+    onClick: () => void
+  }
+} {
+  switch (error.status) {
+    case 402:
+      switch (error.error.code) {
+        case 'LTX_INSUFFICIENT_FUNDS':
+          return {
+            humanMessage: 'Your LTX API credits are insufficient for this generation. Buy more credits in LTX and try again.',
+            technicalDetails: JSON.stringify(error.error, null, 2),
+            primaryAction: {
+              label: 'Buy Credits',
+              onClick: () => {
+                void window.electronAPI.openLtxBillingPage()
+              },
+            },
+          }
+      }
+      return assertNever(error.error.code)
+    case '4XX':
+    case '5XX':
+    case 'default':
+      return {
+        humanMessage: getGenericHumanMessage(error.error.message),
+        technicalDetails: JSON.stringify(error.error, null, 2),
+      }
+    default:
+      return assertNever(error)
+  }
+}
+
 export function GenerationErrorDialog({ error, onDismiss }: GenerationErrorDialogProps) {
   const [detailsExpanded, setDetailsExpanded] = useState(false)
+  const dialogModel = getDialogModel(error)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
       <div className="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-[480px] flex flex-col overflow-hidden">
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800">
           <div className="flex items-center gap-3">
             <AlertCircle className="h-5 w-5 text-red-400" />
@@ -49,13 +90,11 @@ export function GenerationErrorDialog({ error, onDismiss }: GenerationErrorDialo
           </button>
         </div>
 
-        {/* Body */}
         <div className="px-6 py-5">
           <p className="text-sm text-zinc-300 leading-relaxed">
-            {getHumanMessage(error)}
+            {dialogModel.humanMessage}
           </p>
 
-          {/* Expandable technical details */}
           <div className="mt-4">
             <button
               onClick={() => setDetailsExpanded(!detailsExpanded)}
@@ -66,20 +105,36 @@ export function GenerationErrorDialog({ error, onDismiss }: GenerationErrorDialo
             </button>
             {detailsExpanded && (
               <pre className="mt-2 bg-zinc-800/50 rounded-lg p-3 text-[11px] text-zinc-400 whitespace-pre-wrap break-words max-h-40 overflow-auto">
-                {error}
+                {dialogModel.technicalDetails}
               </pre>
             )}
           </div>
         </div>
 
-        {/* Footer */}
-        <div className="px-6 py-4 border-t border-zinc-800 flex justify-end">
-          <button
-            onClick={onDismiss}
-            className="px-4 py-2 bg-zinc-100 text-zinc-900 text-sm font-medium rounded-lg hover:bg-white transition-colors"
-          >
-            Try Again
-          </button>
+        <div className={`px-6 py-4 border-t border-zinc-800 flex items-center gap-3 ${dialogModel.primaryAction ? 'justify-between' : 'justify-end'}`}>
+          {dialogModel.primaryAction ? (
+            <button
+              onClick={onDismiss}
+              className="px-4 py-2 bg-zinc-800 text-zinc-100 text-sm font-medium rounded-lg hover:bg-zinc-700 transition-colors"
+            >
+              Try Again
+            </button>
+          ) : null}
+          {dialogModel.primaryAction ? (
+            <button
+              onClick={dialogModel.primaryAction.onClick}
+              className="px-4 py-2 bg-zinc-100 text-zinc-900 text-sm font-medium rounded-lg hover:bg-white transition-colors"
+            >
+              {dialogModel.primaryAction.label}
+            </button>
+          ) : (
+            <button
+              onClick={onDismiss}
+              className="px-4 py-2 bg-zinc-100 text-zinc-900 text-sm font-medium rounded-lg hover:bg-white transition-colors"
+            >
+              Try Again
+            </button>
+          )}
         </div>
       </div>
     </div>

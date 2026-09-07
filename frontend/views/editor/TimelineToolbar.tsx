@@ -1,8 +1,8 @@
 import React from 'react'
-import { Plus, Gauge, Download, Maximize2, FileUp, FileDown, ZoomOut, ZoomIn } from 'lucide-react' // IC-LORA HIDDEN: removed Sparkles
+import { Plus, Gauge, Download, Maximize2, Sparkles, FileUp, FileDown, ZoomOut, ZoomIn } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { Tooltip } from '../../components/ui/tooltip'
-import type { TimelineClip, Track, SubtitleClip } from '../../types/project'
+import type { TimelineClip, Track, SubtitleClip } from '../../types/project-model'
 
 interface TimelineToolbarProps {
   selectedClip: TimelineClip | null
@@ -10,8 +10,8 @@ interface TimelineToolbarProps {
   getMaxClipDuration: (clip: TimelineClip) => number
   setShowExportModal: (v: boolean) => void
   handleResetLayout: () => void
-  setIcLoraSourceClipId: (id: string | null) => void
-  setShowICLoraPanel: (v: boolean) => void
+  canUseIcLora: boolean
+  onICLoraClip: (clip: TimelineClip) => void
   tracks: Track[]
   subtitleFileInputRef: React.RefObject<HTMLInputElement>
   handleImportSrt: (e: React.ChangeEvent<HTMLInputElement>) => void
@@ -27,7 +27,7 @@ interface TimelineToolbarProps {
 export function TimelineToolbar({
   selectedClip, updateClip, getMaxClipDuration,
   setShowExportModal, handleResetLayout,
-  setIcLoraSourceClipId: _setIcLoraSourceClipId, setShowICLoraPanel: _setShowICLoraPanel, // IC-LORA HIDDEN
+  canUseIcLora, onICLoraClip,
   tracks, subtitleFileInputRef, handleImportSrt, handleExportSrt, subtitles,
   zoom, setZoom, getMinZoom, centerOnPlayheadRef, handleFitToView,
 }: TimelineToolbarProps) {
@@ -92,23 +92,25 @@ export function TimelineToolbar({
         Layout
       </Button>
       
-      {/* IC-LORA HIDDEN - IC-LoRA toolbar button hidden because IC-LoRA is broken on server
       <div className="w-px h-4 bg-zinc-700" />
 
-      <Button
-        variant="outline"
-        size="sm"
-        className="h-6 border-amber-700/50 text-amber-400 text-[10px] px-2 hover:bg-amber-900/30"
-        onClick={() => {
-          setIcLoraSourceClipId(selectedClip?.type === 'video' ? selectedClip.id : null)
-          setShowICLoraPanel(true)
-        }}
-        title="Open IC-LoRA style transfer panel"
-      >
-        <Sparkles className="h-3 w-3 mr-1" />
-        IC-LoRA
-      </Button>
-      */}
+      {canUseIcLora && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-6 border-amber-700/50 text-amber-400 text-[10px] px-2 hover:bg-amber-900/30"
+          onClick={() => {
+            if (selectedClip?.type === 'video') {
+              onICLoraClip(selectedClip)
+            }
+          }}
+          disabled={selectedClip?.type !== 'video'}
+          title="Open IC-LoRA style transfer panel"
+        >
+          <Sparkles className="h-3 w-3 mr-1" />
+          IC-LoRA
+        </Button>
+      )}
       
       
       {/* Subtitle import/export */}

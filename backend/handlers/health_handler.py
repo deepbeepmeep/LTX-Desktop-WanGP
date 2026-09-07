@@ -1,21 +1,25 @@
-"""Health and startup lifecycle handler."""
+"""Health and hardware info handlers."""
 
 from __future__ import annotations
 
 from threading import RLock
 from typing import TYPE_CHECKING
 
-from api_types import GpuInfoResponse, GpuTelemetry, HealthResponse, ModelStatusItem
-from handlers.base import StateHandlerBase, with_state_lock
+from api_types import GpuInfoResponse, GpuTelemetry, HealthResponse, ModelStatusItem, MpsMemoryResponse
+from handlers.base import StateHandlerBase
 from handlers.models_handler import ModelsHandler
-from handlers.pipelines_handler import PipelinesHandler
-from logging_policy import log_background_exception
 from services.interfaces import GpuInfo
+<<<<<<< HEAD
 from services.wangp_bridge import WanGPBridge
 from state.app_state_types import AppState, GpuSlot, StartupError, StartupLoading, StartupPending, StartupReady, VideoPipelineState, VideoPipelineWarmth
+=======
+from state.app_state_types import AppState, GpuSlot, VideoPipelineState
+>>>>>>> upstream/main
 
 if TYPE_CHECKING:
     from runtime_config.runtime_config import RuntimeConfig
+
+_BYTES_PER_MIB = 1024 * 1024
 
 
 class HealthHandler(StateHandlerBase):
@@ -24,18 +28,13 @@ class HealthHandler(StateHandlerBase):
         state: AppState,
         lock: RLock,
         models_handler: ModelsHandler,
-        pipelines_handler: PipelinesHandler,
         gpu_info: GpuInfo,
         config: RuntimeConfig,
-        use_sage_attention: bool,
         wangp_bridge: WanGPBridge,
     ) -> None:
-        super().__init__(state, lock)
+        super().__init__(state, lock, config)
         self._models = models_handler
-        self._pipelines = pipelines_handler
         self._gpu_info = gpu_info
-        self._config = config
-        self._use_sage_attention = use_sage_attention
         self._wangp_bridge = wangp_bridge
 
     def get_health(self) -> HealthResponse:
@@ -68,20 +67,20 @@ class HealthHandler(StateHandlerBase):
                 case _:
                     pass
 
-        files = self._models.refresh_available_files()
+        downloaded_checkpoints = self._models.get_downloaded_checkpoints()
 
         return HealthResponse(
             status="ok",
             models_loaded=models_loaded,
             active_model=active_model,
             gpu_info=GpuTelemetry(**self._gpu_info.get_gpu_info()),
-            sage_attention=self._use_sage_attention,
+            sage_attention=self.config.use_sage_attention,
             models_status=[
                 ModelStatusItem(
                     id="fast",
-                    name="LTX-2 Fast (Distilled)",
+                    name="LTX-2 Fast",
                     loaded=models_loaded,
-                    downloaded=files["checkpoint"] is not None,
+                    downloaded=any(cp_id.startswith("ltx-") for cp_id in downloaded_checkpoints),
                 ),
             ],
         )
@@ -96,23 +95,16 @@ class HealthHandler(StateHandlerBase):
             gpu_info=GpuTelemetry(**self._gpu_info.get_gpu_info()),
         )
 
-    @with_state_lock
-    def set_startup_pending(self, message: str) -> None:
-        self.state.startup = StartupPending(message=message)
+    def get_mps_memory(self) -> MpsMemoryResponse:
+        """Read-only Apple Silicon MPS memory snapshot (torch-tracked / driver-allocated /
+        recommended-max, MiB). ``available`` is False off MPS. No side effects; torch is
+        imported lazily so the call is cheap and safe on non-MPS hosts."""
+        import sys
 
-    @with_state_lock
-    def set_startup_loading(self, step: str, progress: float) -> None:
-        self.state.startup = StartupLoading(current_step=step, progress=progress)
+        import torch
 
-    @with_state_lock
-    def set_startup_ready(self) -> None:
-        self.state.startup = StartupReady()
-
-    @with_state_lock
-    def set_startup_error(self, error: str) -> None:
-        self.state.startup = StartupError(error=error)
-
-    def default_warmup(self) -> None:
+        if sys.platform != "darwin" or not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            return MpsMemoryResponse(available=False)
         try:
             if self._config.wangp_enabled:
                 status = self._wangp_bridge.get_status()
@@ -159,3 +151,12 @@ class HealthHandler(StateHandlerBase):
         except Exception as exc:
             log_background_exception("health-default-warmup", exc)
             self.set_startup_error(str(exc))
+
+            return MpsMemoryResponse(
+                available=True,
+                allocated_mib=round(torch.mps.current_allocated_memory() / _BYTES_PER_MIB),
+                driver_mib=round(torch.mps.driver_allocated_memory() / _BYTES_PER_MIB),
+                recommended_max_mib=round(torch.mps.recommended_max_memory() / _BYTES_PER_MIB),
+            )
+        except Exception:  # noqa: BLE001
+            return MpsMemoryResponse(available=False)

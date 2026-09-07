@@ -6,25 +6,25 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+import torch
 
-from state.app_settings import AppSettings
 from app_factory import create_app
-from state import RuntimeConfig, build_initial_state, set_state_service_for_tests
 from app_handler import ServiceBundle
-from runtime_config.model_download_specs import DEFAULT_MODEL_DOWNLOAD_SPECS, DEFAULT_REQUIRED_MODEL_TYPES
+from runtime_config.model_download_specs import (
+    DEPTH_PROCESSOR_CP_ID,
+    IMG_GEN_MODEL_CP_ID,
+    get_ic_loras_cp_ids,
+    get_latest_ltx_model_id,
+    get_ltx_model_spec,
+    resolve_model_path,
+)
+from runtime_config.port_constant import PORT
+from state import RuntimeConfig, build_initial_state, set_state_service_for_tests
+from state.app_settings import AppSettings
+from state.app_state_types import HfAuthenticated
+from services.gemini_text_client import clear_gemini_models_cache
+from tests.fake_camera_motion_prompts import FAKE_CAMERA_MOTION_PROMPTS
 from tests.fakes.services import FakeServices
-
-CAMERA_MOTION_PROMPTS = {
-    "none": "",
-    "static": ", static camera, locked off shot, no camera movement",
-    "focus_shift": ", focus shift, rack focus, changing focal point",
-    "dolly_in": ", dolly in, camera pushing forward, smooth forward movement",
-    "dolly_out": ", dolly out, camera pulling back, smooth backward movement",
-    "dolly_left": ", dolly left, camera tracking left, lateral movement",
-    "dolly_right": ", dolly right, camera tracking right, lateral movement",
-    "jib_up": ", jib up, camera rising up, upward crane movement",
-    "jib_down": ", jib down, camera lowering down, downward crane movement",
-}
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, "
@@ -32,6 +32,15 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 DEFAULT_APP_SETTINGS = AppSettings()
+
+
+@pytest.fixture(autouse=True)
+def _reset_generation_interrupt() -> None:
+    from services.generation_interrupt import clear
+
+    clear()
+    yield
+    clear()
 
 
 @pytest.fixture
@@ -42,26 +51,24 @@ def fake_services() -> FakeServices:
 @pytest.fixture(autouse=True)
 def test_state(tmp_path: Path, fake_services: FakeServices):
     """Provide a fresh AppHandler per test and register it in DI."""
+    clear_gemini_models_cache()
     app_data = tmp_path / "app_data"
-    models_dir = app_data / "models"
+    default_models_dir = app_data / "models"
     outputs_dir = tmp_path / "outputs"
-    ic_lora_dir = models_dir / "ic-loras"
 
-    for directory in (models_dir, outputs_dir, ic_lora_dir, app_data):
+    for directory in (default_models_dir, outputs_dir, app_data):
         directory.mkdir(parents=True, exist_ok=True)
 
     config = RuntimeConfig(
-        device="cpu",
-        models_dir=models_dir,
-        model_download_specs=DEFAULT_MODEL_DOWNLOAD_SPECS,
-        required_model_types=DEFAULT_REQUIRED_MODEL_TYPES,
+        device=torch.device("cpu"),
+        app_data_dir=app_data,
+        default_models_dir=default_models_dir,
         outputs_dir=outputs_dir,
-        ic_lora_dir=ic_lora_dir,
         settings_file=app_data / "settings.json",
         ltx_api_base_url="https://api.ltx.video",
-        force_api_generations=False,
+        local_generations_mode="full_models_loading",
         use_sage_attention=False,
-        camera_motion_prompts=CAMERA_MOTION_PROMPTS,
+        camera_motion_prompts=FAKE_CAMERA_MOTION_PROMPTS,
         default_negative_prompt=DEFAULT_NEGATIVE_PROMPT,
         wangp_enabled=False,
         wangp_root=None,
@@ -70,12 +77,16 @@ def test_state(tmp_path: Path, fake_services: FakeServices):
         wangp_video_model_type="ltx2_22B_distilled",
         wangp_image_model_type="z_image",
         wangp_extra_args=(),
+        dev_mode=False,
+        hf_oauth_client_id="test-client-id",
+        backend_port=PORT,
     )
 
     bundle = ServiceBundle(
         http=fake_services.http,
         gpu_cleaner=fake_services.gpu_cleaner,
         model_downloader=fake_services.model_downloader,
+        lora_catalog_provider=fake_services.lora_catalog_provider,
         gpu_info=fake_services.gpu_info,
         video_processor=fake_services.video_processor,
         text_encoder=fake_services.text_encoder,
@@ -85,9 +96,11 @@ def test_state(tmp_path: Path, fake_services: FakeServices):
         fast_video_pipeline_class=type(fake_services.fast_video_pipeline),
         image_generation_pipeline_class=type(fake_services.image_generation_pipeline),
         ic_lora_pipeline_class=type(fake_services.ic_lora_pipeline),
+        depth_processor_pipeline_class=type(fake_services.depth_processor_pipeline),
+        pose_processor_pipeline_class=type(fake_services.pose_processor_pipeline),
         a2v_pipeline_class=type(fake_services.a2v_pipeline),
         retake_pipeline_class=type(fake_services.retake_pipeline),
-        ic_lora_model_downloader=fake_services.ic_lora_model_downloader,
+        prompt_enhancer_pipeline_class=type(fake_services.prompt_enhancer_pipeline),
     )
 
     handler = build_initial_state(
@@ -95,15 +108,22 @@ def test_state(tmp_path: Path, fake_services: FakeServices):
         DEFAULT_APP_SETTINGS.model_copy(deep=True),
         service_bundle=bundle,
     )
+    handler.state.hf_auth_state = HfAuthenticated(
+        access_token="fake-hf-token",
+        expires_at=1e18,
+    )
     set_state_service_for_tests(handler)
     yield handler
+
+
+TEST_ADMIN_TOKEN = "test-admin-token"
 
 
 @pytest.fixture
 def client(test_state):
     from starlette.testclient import TestClient
 
-    app = create_app(handler=test_state)
+    app = create_app(handler=test_state, admin_token=TEST_ADMIN_TOKEN)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -113,23 +133,54 @@ def default_app_settings() -> AppSettings:
     return DEFAULT_APP_SETTINGS.model_copy(deep=True)
 
 
+def _test_model_path(test_state, cp_id: str) -> Path:
+    return resolve_model_path(test_state.config.default_models_dir, cp_id)
+
+
 @pytest.fixture
 def create_fake_model_files(test_state):
-    def _create(include_zit: bool = False):
-        for path in (
-            test_state.config.model_path("checkpoint"),
-            test_state.config.model_path("upsampler"),
+    def _create(
+        include_zit: bool = False,
+        model_id: str | None = None,
+        include_prompt_enhancer: bool = False,
+    ):
+        from runtime_config.model_download_specs import get_model_cp_spec
+
+        ltx_spec = get_ltx_model_spec(model_id or get_latest_ltx_model_id())
+
+        for cp_id in (
+            ltx_spec.model_cp,
+            ltx_spec.upscale_cp,
+            ltx_spec.video_vae_cp,
+            ltx_spec.video_vae_conv_cp,
+            ltx_spec.audio_vae_cp,
+            ltx_spec.duration_head_cp,
         ):
+            if cp_id is None:
+                continue
+            path = _test_model_path(test_state, cp_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"\x00" * 1024)
 
-        te_dir = test_state.config.model_path("text_encoder")
-        te_dir.mkdir(parents=True, exist_ok=True)
-        (te_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
-        (te_dir / "tokenizer.model").write_bytes(b"\x00" * 1024)
+        def _write_cp(cp_id: str) -> None:
+            path = _test_model_path(test_state, cp_id)
+            if get_model_cp_spec(cp_id).is_folder:
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "model.safetensors").write_bytes(b"\x00" * 1024)
+                (path / "tokenizer.model").write_bytes(b"\x00" * 1024)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"\x00" * 1024)
+
+        _write_cp(ltx_spec.text_encoder_cp)
+
+        # Left out by default: it's an optional extra download, so tests opt in to the state
+        # where local Enhance is available for models that need it (2.5).
+        if include_prompt_enhancer and ltx_spec.prompt_enhancer_cp is not None:
+            _write_cp(ltx_spec.prompt_enhancer_cp)
 
         if include_zit:
-            zit_dir = test_state.config.model_path("zit")
+            zit_dir = _test_model_path(test_state, IMG_GEN_MODEL_CP_ID)
             zit_dir.mkdir(parents=True, exist_ok=True)
             (zit_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
@@ -137,12 +188,43 @@ def create_fake_model_files(test_state):
 
 
 @pytest.fixture
+def create_fake_lora(test_state):
+    """Write a fake LoRA file under the models dir and return its resolved path.
+
+    Refs are now contained to models_dir + must exist (resolve_lora_ref), so tests
+    that forward LoRAs need a real on-disk file rather than an arbitrary path.
+    """
+    def _create(name: str = "style.safetensors") -> str:
+        loras_dir = test_state.config.default_models_dir / "loras"
+        loras_dir.mkdir(parents=True, exist_ok=True)
+        path = loras_dir / name
+        path.write_bytes(b"\x00" * 1024)
+        return str(path.resolve())
+
+    return _create
+
+
+# Built-in depth/canny Union Control IC-LoRA ships with LTX 2.3 only.
+_IC_LORA_MODEL_ID = "ltx-2.3-22b-distilled-1.1"
+
+
+@pytest.fixture
 def create_fake_ic_lora_files(test_state):
-    def _create(names: list[str]):
-        for name in names:
-            path = test_state.config.ic_lora_dir / f"{name}.safetensors"
+    def _create(include_depth: bool = True):
+        ltx_spec = get_ltx_model_spec(_IC_LORA_MODEL_ID)
+        for cp_id in get_ic_loras_cp_ids(ltx_spec.ic_loras_spec):
+            path = _test_model_path(test_state, cp_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"\x00" * 1024)
+
+        if include_depth:
+            depth_path = _test_model_path(test_state, DEPTH_PROCESSOR_CP_ID)
+            depth_path.parent.mkdir(parents=True, exist_ok=True)
+            if depth_path.suffix:
+                depth_path.write_bytes(b"\x00" * 1024)
+            else:
+                depth_path.mkdir(parents=True, exist_ok=True)
+                (depth_path / "config.json").write_text("{}", encoding="utf-8")
 
     return _create
 

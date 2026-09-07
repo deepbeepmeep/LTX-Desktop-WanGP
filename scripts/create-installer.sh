@@ -67,7 +67,7 @@ if [ ! -d "dist" ] || [ ! -d "dist-electron" ]; then
   exit 1
 fi
 
-if [ ! -d "python-embed" ]; then
+if [ "$PLATFORM" != "linux" ] && [ ! -d "python-embed" ]; then
   echo "ERROR: Python environment not found. Run local-build.sh or prepare-python.sh first."
   exit 1
 fi
@@ -113,6 +113,13 @@ if [ "$UNPACK" = true ]; then
       echo ""
       echo "Unpacked app ready!"
       echo "Run: $RELEASE_DIR/win-unpacked/LTX Desktop.exe"
+      ;;
+    linux)
+      echo ""
+      echo "Unpacked app ready!"
+      LINUX_UNPACKED="$RELEASE_DIR/linux-unpacked"
+      [ -d "$RELEASE_DIR/linux-arm64-unpacked" ] && LINUX_UNPACKED="$RELEASE_DIR/linux-arm64-unpacked"
+      echo "Run: $LINUX_UNPACKED/ltx-desktop"
       ;;
   esac
 else

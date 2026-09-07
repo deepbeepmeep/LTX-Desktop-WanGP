@@ -30,11 +30,7 @@ pnpm -v
 Setup:
 
 ```bash
-# macOS
-pnpm setup:dev:mac
-
-# Windows
-pnpm setup:dev:win
+pnpm setup:dev
 ```
 
 On Windows, `pnpm setup:dev:win` installs Wan2GP Python dependencies into the backend venv so the desktop app can use the WanGP engine directly. If a repo-local `Wan2GP/` subfolder exists it is used first; otherwise, if `WANGP_ROOT` points to an existing checkout, that checkout is reused instead.

@@ -1,3 +1,4 @@
+import './win-dll-search'
 import './app-paths'
 import { app } from 'electron'
 import { setupCSP } from './csp'
@@ -7,11 +8,20 @@ import { registerAppHandlers } from './ipc/app-handlers'
 import { registerFileHandlers } from './ipc/file-handlers'
 import { registerLogHandlers } from './ipc/log-handlers'
 import { registerVideoProcessingHandlers } from './ipc/video-processing-handlers'
+import { logger } from './logger'
 import { initSessionLog } from './logging-management'
 import { stopPythonBackend } from './python-backend'
 import { initAutoUpdater } from './updater'
 import { createWindow, getMainWindow } from './window'
 import { sendAnalyticsEvent } from './analytics'
+
+function logAppVersion(): void {
+  if (!app.isPackaged) {
+    logger.info('[LTX Desktop] Running in development mode')
+  } else {
+    logger.info(`[LTX Desktop] Version ${app.getVersion()}`)
+  }
+}
 
 const gotLock = app.requestSingleInstanceLock()
 
@@ -19,6 +29,7 @@ if (!gotLock) {
   app.quit()
 } else {
   initSessionLog()
+  logAppVersion()
 
   registerAppHandlers()
   registerFileHandlers()

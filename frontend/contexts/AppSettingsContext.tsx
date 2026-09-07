@@ -1,47 +1,51 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { backendFetch, resetBackendCredentials } from '../lib/backend'
-
-export interface InferenceSettings {
-  steps: number
-  useUpscaler: boolean
-}
-
-export interface FastModelSettings {
-  useUpscaler: boolean
-}
+import { resetBackendCredentials } from '../lib/backend'
+import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
 
 export interface AppSettings {
   useTorchCompile: boolean
-  loadOnStartup: boolean
+  diffusionStageCacheEnabled: boolean
   hasLtxApiKey: boolean
   userPrefersLtxApiVideoGenerations: boolean
   hasFalApiKey: boolean
+  userPrefersFalApiImageGenerations: boolean
   hasGeminiApiKey: boolean
+  geminiModel: string
   useLocalTextEncoder: boolean
-  fastModel: FastModelSettings
-  proModel: InferenceSettings
   promptCacheSize: number
   promptEnhancerEnabledT2V: boolean
   promptEnhancerEnabledI2V: boolean
+  // The user's explicit prompt-enhancer provider choice, persisted so it survives restarts.
+  // null means no active choice yet — the enhancer defaults to whichever provider is available
+  // without writing that default back here; only an explicit pick (never an automatic fallback
+  // when the preferred provider is temporarily unavailable) sets this.
+  promptEnhancerProviderPreference: 'local' | 'api' | null
   seedLocked: boolean
   lockedSeed: number
+  modelsDir: string
+  useConvVae: boolean
 }
+
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite'
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   useTorchCompile: false,
-  loadOnStartup: true,
+  diffusionStageCacheEnabled: false,
   hasLtxApiKey: false,
   userPrefersLtxApiVideoGenerations: false,
   hasFalApiKey: false,
+  userPrefersFalApiImageGenerations: false,
   hasGeminiApiKey: false,
+  geminiModel: '',
   useLocalTextEncoder: false,
-  fastModel: { useUpscaler: true },
-  proModel: { steps: 20, useUpscaler: true },
   promptCacheSize: 1,
   promptEnhancerEnabledT2V: false,
   promptEnhancerEnabledI2V: false,
+  promptEnhancerProviderPreference: null,
   seedLocked: false,
   lockedSeed: 42,
+  modelsDir: '',
+  useConvVae: false,
 }
 
 type BackendProcessStatus = 'alive' | 'restarting' | 'dead'
@@ -57,6 +61,13 @@ interface AppSettingsContextValue {
   saveGeminiApiKey: (value: string) => Promise<void>
   forceApiGenerations: boolean
   shouldVideoGenerateWithLtxApi: boolean
+  shouldImageGenerateWithFalApi: boolean
+  cudaAvailable: boolean
+  // Bumped whenever installed models change (download / delete / activate a version). Generation
+  // model specs are derived from the *active* local model, so anything reading them must refetch;
+  // without this they stay pinned to whatever was installed at app start.
+  modelsVersion: number
+  notifyModelsChanged: () => void
 }
 
 const AppSettingsContext = createContext<AppSettingsContextValue | null>(null)
@@ -76,28 +87,40 @@ function toBackendProcessStatus(value: unknown): BackendProcessStatus | null {
 function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
   return {
     useTorchCompile: data.useTorchCompile ?? DEFAULT_APP_SETTINGS.useTorchCompile,
-    loadOnStartup: data.loadOnStartup ?? DEFAULT_APP_SETTINGS.loadOnStartup,
+    diffusionStageCacheEnabled: data.diffusionStageCacheEnabled ?? DEFAULT_APP_SETTINGS.diffusionStageCacheEnabled,
     hasLtxApiKey: data.hasLtxApiKey ?? DEFAULT_APP_SETTINGS.hasLtxApiKey,
     userPrefersLtxApiVideoGenerations: data.userPrefersLtxApiVideoGenerations ?? DEFAULT_APP_SETTINGS.userPrefersLtxApiVideoGenerations,
     hasFalApiKey: data.hasFalApiKey ?? DEFAULT_APP_SETTINGS.hasFalApiKey,
+    userPrefersFalApiImageGenerations: data.userPrefersFalApiImageGenerations ?? DEFAULT_APP_SETTINGS.userPrefersFalApiImageGenerations,
     hasGeminiApiKey: data.hasGeminiApiKey ?? DEFAULT_APP_SETTINGS.hasGeminiApiKey,
+    geminiModel: data.geminiModel ?? DEFAULT_APP_SETTINGS.geminiModel,
     useLocalTextEncoder: data.useLocalTextEncoder ?? DEFAULT_APP_SETTINGS.useLocalTextEncoder,
-    fastModel: data.fastModel ?? DEFAULT_APP_SETTINGS.fastModel,
-    proModel: data.proModel ?? DEFAULT_APP_SETTINGS.proModel,
     promptCacheSize: data.promptCacheSize ?? DEFAULT_APP_SETTINGS.promptCacheSize,
     promptEnhancerEnabledT2V: data.promptEnhancerEnabledT2V ?? DEFAULT_APP_SETTINGS.promptEnhancerEnabledT2V,
     promptEnhancerEnabledI2V: data.promptEnhancerEnabledI2V ?? DEFAULT_APP_SETTINGS.promptEnhancerEnabledI2V,
+    promptEnhancerProviderPreference: data.promptEnhancerProviderPreference ?? DEFAULT_APP_SETTINGS.promptEnhancerProviderPreference,
     seedLocked: data.seedLocked ?? DEFAULT_APP_SETTINGS.seedLocked,
     lockedSeed: data.lockedSeed ?? DEFAULT_APP_SETTINGS.lockedSeed,
+    modelsDir: data.modelsDir ?? DEFAULT_APP_SETTINGS.modelsDir,
+    useConvVae: data.useConvVae ?? DEFAULT_APP_SETTINGS.useConvVae,
   }
 }
+
+type RuntimePolicyPayload = ApiSuccessOf<'getRuntimePolicy'>
+type GpuInfoPayload = ApiSuccessOf<'getGpuInfo'>
 
 export function AppSettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS)
   const [isLoaded, setIsLoaded] = useState(false)
   const [runtimePolicyLoaded, setRuntimePolicyLoaded] = useState(false)
   const [forceApiGenerations, setForceApiGenerations] = useState(true)
+  const [cudaAvailable, setCudaAvailable] = useState(false)
   const [backendProcessStatus, setBackendProcessStatus] = useState<BackendProcessStatus | null>(null)
+  const [modelsVersion, setModelsVersion] = useState(0)
+
+  const notifyModelsChanged = useCallback(() => {
+    setModelsVersion((current) => current + 1)
+  }, [])
 
   useEffect(() => {
     if (backendProcessStatus !== 'alive') return
@@ -106,29 +129,27 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
     setRuntimePolicyLoaded(false)
 
     const fetchRuntimePolicy = async () => {
-      try {
-        const response = await backendFetch('/api/runtime-policy')
-        if (!response.ok) {
-          throw new Error(`Runtime policy fetch failed with status ${response.status}`)
-        }
-
-        const payload = (await response.json()) as { force_api_generations?: unknown }
-        if (typeof payload.force_api_generations !== 'boolean') {
-          throw new Error('Runtime policy response missing force_api_generations boolean')
-        }
-
-        if (!cancelled) {
-          setForceApiGenerations(payload.force_api_generations)
-        }
-      } catch {
+      const result = await ApiClient.getRuntimePolicy()
+      if (!result.ok) {
         if (!cancelled) {
           // Fail closed until policy can be read.
           setForceApiGenerations(true)
-        }
-      } finally {
-        if (!cancelled) {
           setRuntimePolicyLoaded(true)
         }
+        return
+      }
+
+      const payload = result.data as RuntimePolicyPayload
+      if (typeof payload.force_api_generations !== 'boolean') {
+        if (!cancelled) {
+          setForceApiGenerations(true)
+        }
+      } else if (!cancelled) {
+        setForceApiGenerations(payload.force_api_generations)
+      }
+
+      if (!cancelled) {
+        setRuntimePolicyLoaded(true)
       }
     }
 
@@ -138,6 +159,26 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       cancelled = true
     }
   }, [backendProcessStatus])
+
+  useEffect(() => {
+    if (backendProcessStatus !== 'alive') return
+
+    let cancelled = false
+
+    const fetchGpuInfo = async () => {
+      const result = await ApiClient.getGpuInfo()
+      if (!result.ok || cancelled) return
+
+      const payload = result.data as GpuInfoPayload
+      setCudaAvailable(Boolean(payload.cuda_available))
+    }
+
+    void fetchGpuInfo()
+
+    return () => {
+      cancelled = true
+    }
+  }, [backendProcessStatus, modelsVersion])
 
   useEffect(() => {
     let cancelled = false
@@ -172,12 +213,11 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const refreshSettings = useCallback(async () => {
-    const response = await backendFetch('/api/settings')
-    if (!response.ok) {
-      throw new Error(`Settings fetch failed with status ${response.status}`)
+    const result = await ApiClient.getSettings()
+    if (!result.ok) {
+      throw new Error(result.error.message)
     }
-    const data = await response.json()
-    setSettings(normalizeAppSettings(data))
+    setSettings(normalizeAppSettings(result.data))
     setIsLoaded(true)
   }, [])
 
@@ -209,14 +249,9 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!isLoaded || backendProcessStatus !== 'alive') return
     const syncTimer = setTimeout(async () => {
-      try {
-        const { hasLtxApiKey: _a, hasFalApiKey: _b, hasGeminiApiKey: _c, ...syncPayload } = settings
-        await backendFetch('/api/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(syncPayload),
-        })
-      } catch {
+      const { hasLtxApiKey: _a, hasFalApiKey: _b, hasGeminiApiKey: _c, modelsDir: _d, ...syncPayload } = settings
+      const result = await ApiClient.updateSettings(syncPayload)
+      if (!result.ok) {
         // Best-effort settings sync.
       }
     }, 150)
@@ -232,46 +267,33 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const saveLtxApiKey = useCallback(async (value: string) => {
-    const response = await backendFetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ltxApiKey: value }),
-    })
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new Error(detail || 'Failed to save LTX API key.')
+    const result = await ApiClient.updateSettings({ ltxApiKey: value })
+    if (!result.ok) {
+      throw new Error(result.error.message)
     }
     await refreshSettings()
   }, [refreshSettings])
 
   const saveGeminiApiKey = useCallback(async (value: string) => {
-    const response = await backendFetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ geminiApiKey: value }),
-    })
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new Error(detail || 'Failed to save Gemini API key.')
+    const result = await ApiClient.updateSettings({ geminiApiKey: value })
+    if (!result.ok) {
+      throw new Error(result.error.message)
     }
     await refreshSettings()
   }, [refreshSettings])
 
   const saveFalApiKey = useCallback(async (value: string) => {
-    const response = await backendFetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ falApiKey: value }),
-    })
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new Error(detail || 'Failed to save FAL API key.')
+    const result = await ApiClient.updateSettings({ falApiKey: value })
+    if (!result.ok) {
+      throw new Error(result.error.message)
     }
     await refreshSettings()
   }, [refreshSettings])
 
   const shouldVideoGenerateWithLtxApi =
     forceApiGenerations || (settings.userPrefersLtxApiVideoGenerations && settings.hasLtxApiKey)
+  const shouldImageGenerateWithFalApi =
+    forceApiGenerations || (settings.userPrefersFalApiImageGenerations && settings.hasFalApiKey)
 
   const contextValue = useMemo<AppSettingsContextValue>(
     () => ({
@@ -285,8 +307,12 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       saveGeminiApiKey,
       forceApiGenerations,
       shouldVideoGenerateWithLtxApi,
+      shouldImageGenerateWithFalApi,
+      cudaAvailable,
+      modelsVersion,
+      notifyModelsChanged,
     }),
-    [forceApiGenerations, isLoaded, refreshSettings, runtimePolicyLoaded, saveFalApiKey, saveGeminiApiKey, saveLtxApiKey, settings, shouldVideoGenerateWithLtxApi, updateSettings],
+    [cudaAvailable, forceApiGenerations, isLoaded, modelsVersion, notifyModelsChanged, refreshSettings, runtimePolicyLoaded, saveFalApiKey, saveGeminiApiKey, saveLtxApiKey, settings, shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, updateSettings],
   )
 
   return <AppSettingsContext.Provider value={contextValue}>{children}</AppSettingsContext.Provider>

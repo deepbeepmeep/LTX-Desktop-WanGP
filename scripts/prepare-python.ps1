@@ -1,4 +1,4 @@
-# prepare-python.ps1
+﻿# prepare-python.ps1
 # Downloads embedded Python and installs all dependencies for distribution.
 #
 # Dependencies are read from uv.lock (via `uv export`) — pyproject.toml is the
@@ -142,6 +142,7 @@ Write-Host "`nStep 6: Installing dependencies from requirements.txt..." -Foregro
 $UvAvailable = Get-Command uv -ErrorAction SilentlyContinue
 if ($UvAvailable) {
     & uv pip install -r $RequirementsFile `
+        --project $BackendDir `
         --extra-index-url $PyTorchIndex `
         --index-strategy unsafe-best-match `
         --python $PythonExe

@@ -22,6 +22,21 @@ used by LTX Desktop.
   License: Apache License 2.0
   https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
 
+- **DPT-Hybrid (MiDaS 3.0)**
+  Copyright (c) Intel Corporation.
+  License: Apache License 2.0
+  https://huggingface.co/Intel/dpt-hybrid-midas
+
+- **DW Pose TorchScript (BatchSize5)**
+  Copyright (c) DWPose contributors.
+  License: Apache License 2.0
+  https://huggingface.co/hr16/DWPose-TorchScript-BatchSize5
+
+- **YOLOX Person Detector (TorchScript)**
+  Copyright (c) YOLOX contributors.
+  License: Apache License 2.0
+  https://huggingface.co/hr16/yolox-onnx
+
 ---
 
 ## Python Dependencies
@@ -43,6 +58,7 @@ used by LTX Desktop.
 - **transformers** — Copyright (c) Hugging Face — Apache License 2.0
 - **sentencepiece** — Copyright (c) Google LLC — Apache License 2.0
 - **sageattention** — Copyright (c) Jintao Zhang et al. — Apache License 2.0
+- **natten** — Copyright (c) Ali Hassani, Steven Walton, et al. (SHI Labs) — Apache License 2.0
 - **opencv-python-headless** — Copyright (c) OpenCV team — Apache License 2.0
 - **fastapi** — Copyright (c) Sebastian Ramirez — MIT License
 - **uvicorn** — Copyright (c) Encode OSS Ltd. — BSD 3-Clause License

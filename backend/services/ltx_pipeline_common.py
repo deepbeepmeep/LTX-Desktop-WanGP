@@ -3,22 +3,109 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import torch
 
 from api_types import ImageConditioningInput
-from services.services_utils import AudioOrNone, TilingConfigType, device_supports_fp8, sync_device
+from services.services_utils import AudioOrNone, PipelineTilingType, TilingConfigType, device_supports_fp8
 
 if TYPE_CHECKING:
     from ltx_core.components.guiders import MultiModalGuiderParams
-    from ltx_core.types import LatentState
+    from ltx_pipelines.utils.model_paths import ModelPaths
+    from ltx_pipelines.utils.types import OffloadMode
 
 
-def default_tiling_config() -> TilingConfigType:
-    from ltx_core.model.video_vae import TilingConfig
+def auto_tiling_config() -> PipelineTilingType:
+    """Let the pipeline derive decode tiling from the VAE it will decode with.
 
-    return TilingConfig.default()
+    A conv VAE (2.3 monolith) and a diffusion VAE (2.5 split) need different tile
+    overlaps, so a fixed layout that one accepts the other rejects.
+    """
+    from ltx_core.model.video_vae import AUTO_TILING
+
+    return AUTO_TILING
+
+
+def host_available_bytes() -> int:
+    """Currently available system RAM in bytes (unified memory on Apple Silicon)."""
+    import psutil
+
+    return int(psutil.virtual_memory().available)
+
+
+def diffvae_activation_budget_bytes(device: torch.device | None = None) -> int:
+    """Bytes DiffVAE decode tiling may treat as free activation memory.
+
+    ltx-pipelines only queries the CUDA allocator. On MPS/CPU that path yields 0,
+    so AUTO_TILING raises ``Cannot fit a DiffVAE decode tile`` before decode.
+    CUDA keeps the upstream allocator budget; everywhere else uses available RAM.
+    """
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        from ltx_core.devices import cuda_activation_budget_bytes
+
+        return int(cuda_activation_budget_bytes(device))
+    return host_available_bytes()
+
+
+def resolve_diffvae_free_bytes(device: torch.device | None, free_bytes: int | None) -> int | None:
+    """Fill a DiffVAE tiling budget when upstream would treat non-CUDA as 0."""
+    if free_bytes is not None and free_bytes > 0:
+        return free_bytes
+    if device is not None and device.type == "cuda":
+        return free_bytes
+    return host_available_bytes()
+
+
+def resolve_tiling_config(
+    vae_checkpoint_path: str,
+    *,
+    height: int,
+    width: int,
+    num_frames: int,
+    device: torch.device | None = None,
+) -> TilingConfigType:
+    """Same recommendation ``AUTO_TILING`` resolves to, for pipelines that decode themselves."""
+    from ltx_pipelines.utils.helpers import get_device, tiling_config_for_vae
+
+    if device is None:
+        device = get_device()
+    return tiling_config_for_vae(
+        vae_checkpoint_path,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        device=device,
+        free_bytes=diffvae_activation_budget_bytes(device),
+    )
+
+
+def build_model_paths(
+    checkpoint_path: str,
+    gemma_root: str | None,
+    *,
+    video_vae_path: str | None = None,
+    audio_vae_path: str | None = None,
+    duration_head_path: str | None = None,
+) -> ModelPaths:
+    """Build ``ModelPaths`` for monolith (2.3) or split (2.5) checkpoint layouts.
+
+    When both VAE paths are provided, uses ``from_split`` (LTX 2.5). Otherwise uses
+    ``from_monolith`` where the fat checkpoint also supplies the VAEs and DurationHead.
+    Split 2.5 DurationHead is a separate safetensors; omit ``duration_head_path`` and
+    AutoDuration fails closed in the pipeline.
+    """
+    from ltx_pipelines.utils.model_paths import ModelPaths
+
+    if video_vae_path is not None and audio_vae_path is not None:
+        return ModelPaths.from_split(
+            transformer_path=checkpoint_path,
+            text_encoder_path=gemma_root,
+            video_vae_path=video_vae_path,
+            audio_vae_path=audio_vae_path,
+            duration_head_path=duration_head_path,
+        )
+    return ModelPaths.from_monolith(checkpoint_path, gemma_root, video_vae_path=video_vae_path)
 
 
 def default_guiders() -> tuple[MultiModalGuiderParams, MultiModalGuiderParams]:
@@ -31,6 +118,31 @@ def video_chunks_number(num_frames: int, tiling_config: TilingConfigType | None)
     from ltx_core.model.video_vae import get_video_chunks_number
 
     return int(get_video_chunks_number(num_frames, tiling_config))
+
+
+def offload_mode_for_prefetch_count(streaming_prefetch_count: int | None, device: torch.device) -> OffloadMode:
+    """Translate the desktop's streaming_prefetch_count knob to ltx_pipelines' OffloadMode.
+
+    ltx_pipelines moved weight streaming from a per-call prefetch-count int to a
+    construction-time OffloadMode enum (NONE/CPU/DISK). Desktop's runtime policy
+    (runtime_config/runtime_policy.py) distinguishes fully resident (None) vs streaming
+    (an int); which *kind* of streaming depends on the device's memory model:
+
+    - CUDA: system RAM is separate from VRAM, so OffloadMode.CPU pins the blocks in host
+      RAM and streams them to the smaller VRAM — the fast streaming path.
+    - MPS (Apple Silicon): CPU-pinned weights live in the *same* unified RAM as the GPU,
+      so OffloadMode.CPU (which pins every block, ~46 GB for the bf16 transformer) OOMs.
+      OffloadMode.DISK mmaps blocks from the checkpoint through a small pinned buffer
+      (~5 GB), the only memory-safe streaming path on unified memory. This is the "mmap
+      streaming" the upstream MPS-support work validated on an M4 Pro.
+    """
+    from ltx_pipelines.utils.types import OffloadMode
+
+    if streaming_prefetch_count is None:
+        return OffloadMode.NONE
+    if device.type == "mps":
+        return OffloadMode.DISK
+    return OffloadMode.CPU
 
 
 def encode_video_output(
@@ -61,27 +173,37 @@ class DistilledNativePipeline:
         device: torch.device | None = None,
         fp8transformer: bool = False,
     ) -> None:
-        from ltx_pipelines.utils import ModelLedger
+        from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+        from ltx_pipelines.utils.blocks import (
+            AudioDecoder,
+            DiffusionStage,
+            ImageConditioner,
+            PromptEncoder,
+            VideoDecoder,
+        )
         from ltx_pipelines.utils.helpers import get_device
-        from ltx_pipelines.utils.types import PipelineComponents
 
         if device is None:
             device = get_device()
 
         self.device = device
         self.dtype = torch.bfloat16
+        model_paths = build_model_paths(checkpoint_path, gemma_root)
 
-        from ltx_core.quantization import QuantizationPolicy
-
-        self.model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            gemma_root_path=gemma_root,
-            loras=None,
-            quantization=QuantizationPolicy.fp8_cast() if fp8transformer and device_supports_fp8(device) else None,
+        self.prompt_encoder = PromptEncoder(
+            model_paths, self.dtype, device,
         )
-        self.pipeline_components = PipelineComponents(dtype=self.dtype, device=device)
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, device,
+        )
+        self.stage = DiffusionStage.from_checkpoint(  # type: ignore[reportUnknownMemberType]
+            checkpoint_path,
+            self.dtype,
+            device,
+            quantization=build_fp8_cast_policy(checkpoint_path) if fp8transformer and device_supports_fp8(device) else None,
+        )
+        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, device)
+        self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, device)
 
     @torch.inference_mode()
     def __call__(
@@ -95,88 +217,47 @@ class DistilledNativePipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfigType | None = None,
     ) -> tuple[torch.Tensor | Iterator[torch.Tensor], AudioOrNone]:
-        from ltx_core.components.diffusion_steps import EulerDiffusionStep
         from ltx_core.components.noisers import GaussianNoiser
-        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
-        from ltx_core.model.video_vae import decode_video as vae_decode_video
-        from ltx_core.text_encoders.gemma import encode_text
-        from ltx_core.types import VideoPixelShape
-        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
         from ltx_pipelines.utils.args import ImageConditioningInput as _LtxImageInput
-        from ltx_pipelines.utils.helpers import (
-            cleanup_memory,
-            denoise_audio_video,
-            image_conditionings_by_replacing_latent,
-            simple_denoising_func,
-        )
-        from ltx_pipelines.utils.samplers import euler_denoising_loop
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.denoisers import SimpleDenoiser
+        from ltx_pipelines.utils.helpers import image_conditionings_by_replacing_latent
+        from ltx_pipelines.utils.types import ModalitySpec
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.model_ledger.text_encoder()
-        context_p = encode_text(text_encoder, prompts=[prompt])[0]
-        video_context, audio_context = context_p
+        (ctx_p,) = self.prompt_encoder([prompt])
+        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
-        sync_device(self.device)
-        del text_encoder
-        cleanup_memory()
-
-        video_encoder = self.model_ledger.video_encoder()
-        transformer = self.model_ledger.transformer()
         sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
-        def denoising_loop(
-            sigmas: torch.Tensor,
-            video_state: LatentState,
-            audio_state: LatentState,
-            stepper: EulerDiffusionStep,
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=transformer,
-                ),
+        ltx_images = [_LtxImageInput(img.path, img.frame_idx, img.strength) for img in images]
+        conditionings = self.image_conditioner(
+            lambda enc: image_conditionings_by_replacing_latent(
+                images=ltx_images,
+                height=height,
+                width=width,
+                video_encoder=enc,
+                dtype=dtype,
+                device=self.device,
             )
-
-        output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        conditionings = image_conditionings_by_replacing_latent(
-            images=[_LtxImageInput(img.path, img.frame_idx, img.strength) for img in images],
-            height=output_shape.height,
-            width=output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
         )
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=output_shape,
-            conditionings=conditionings,
-            noiser=noiser,
+        video_state, audio_state = self.stage(
+            denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=sigmas,
-            stepper=stepper,
-            denoising_loop_fn=cast(Any, denoising_loop),
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
+            noiser=noiser,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(context=video_context, conditionings=conditionings),
+            audio=ModalitySpec(context=audio_context) if audio_context is not None else None,
         )
 
-        sync_device(self.device)
-        del transformer
-        del video_encoder
-        cleanup_memory()
-
-        decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder(), tiling_config)
-        decoded_audio = vae_decode_audio(
-            audio_state.latent,
-            self.model_ledger.audio_decoder(),
-            self.model_ledger.vocoder(),
-        )
+        assert video_state is not None
+        decoded_video = self.video_decoder(video_state.latent, tiling_config)
+        decoded_audio = self.audio_decoder(audio_state.latent) if audio_state is not None else None
         return decoded_video, decoded_audio
